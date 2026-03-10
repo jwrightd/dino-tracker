@@ -9,9 +9,11 @@ from tqdm import tqdm
 from tqdm.contrib import tzip
 from matplotlib import pyplot as plt
 import os
+import sys
 
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
-
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from data.data_utils import (
     load_image,
@@ -22,8 +24,25 @@ from data.data_utils import (
     resize_flow
 )
 from utils import bilinear_interpolate_video
+from device_utils import get_device
 
 torch.autograd.set_grad_enabled(False)
+
+def get_sorted_image_paths(input_path: str, max_frames=None):
+    input_folder = Path(input_path)
+    images = sorted(list(input_folder.glob("*.jpg")) + list(input_folder.glob("*.png")))
+    if max_frames is not None:
+        images = images[:max_frames]
+    return images
+
+
+def estimate_flow_buffer_gib(num_images: int, h: int, w: int, dtype=torch.float32) -> float:
+    if num_images < 2:
+        return 0.0
+    n_pairs = num_images - 1
+    elem_size = torch.tensor([], dtype=dtype).element_size()
+    n_elems = 2 * n_pairs * 2 * h * w
+    return (n_elems * elem_size) / (1024 ** 3)
 
 
 @torch.no_grad()
@@ -31,16 +50,26 @@ def get_flows_with_masks(
     model,
     trasnforms,
     input_path: str,
-    device: str = "cuda:0",
+    device=None,
     threshold: float = 1,
     add_missing_forward_warp: bool = True,
-    infer_res_size=None
+    infer_res_size=None,
+    max_frames=None,
 ):
+    device = get_device() if device is None else torch.device(device)
     # reading frames
-    input_folder = Path(input_path)
-    images = list(input_folder.glob("*.jpg")) + list(input_folder.glob("*.png"))
-    images = sorted(images)
+    images = get_sorted_image_paths(input_path, max_frames=max_frames)
+    if len(images) < 2:
+        raise ValueError(f"Need at least 2 frames in '{input_path}' to compute trajectories.")
     h, w = load_image(images[0], device).shape[2:4] if infer_res_size is None else infer_res_size
+
+    estimated_gib = estimate_flow_buffer_gib(len(images), h, w)
+    if estimated_gib > 32:
+        raise RuntimeError(
+            f"Flow buffer is too large (~{estimated_gib:.2f} GiB) for {len(images)} frames at resolution {h}x{w}. "
+            f"Use a smaller '--infer-res-size' and/or set '--max-frames' (e.g. 400)."
+        )
+
     flows = torch.zeros((2, len(images) - 1, 2, h, w), device=device)
     masks_array = torch.zeros((len(images) + 1, h, w, 1), device=device)
     err_array = torch.zeros((len(images) + 1, h, w), device=device)
@@ -100,15 +129,15 @@ def compute_direct_flows_for_start_frame(
     model,
     trasnforms,
     input_path: str,
-    device: str = "cuda:0",
+    device=None,
     threshold: float = 1,
     starting_frame : int = 0,
     infer_res_size=None,
+    max_frames=None,
 ):
+    device = get_device() if device is None else torch.device(device)
     # compute direct flow from starting_frame ot all following frames, along with the mask 
-    input_folder = Path(input_path)
-    images = list(input_folder.glob("*.jpg")) + list(input_folder.glob("*.png"))
-    images = sorted(images)[starting_frame:] # starting from starting_frame, (video_len - starting_frame) images
+    images = get_sorted_image_paths(input_path, max_frames=max_frames)[starting_frame:] # starting from starting_frame, (video_len - starting_frame) images
     
     h, w = load_image(images[0], device).shape[2:4] if infer_res_size is None else infer_res_size
     video = torch.cat([load_image(imfile, device) for imfile in images], dim=0) # (video_len - starting_frame) x 3 x h x w
@@ -162,11 +191,13 @@ def compute_direct_flows_for_start_frame(
 
 @torch.no_grad()
 def save_trajectories(args):
+    selected_device = get_device(log=True)
     print(args)
 
     frames_path = args.frames_path
     output_path = args.output_path
     infer_res_size = args.infer_res_size # (h, w)
+    max_frames = args.max_frames
     threshold = args.threshold
     min_trajectory_length = args.min_trajectory_length
     filter_using_direct_flow = args.filter_using_direct_flow
@@ -174,41 +205,43 @@ def save_trajectories(args):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     # reading frames
-    images = list(Path(frames_path).glob("*.jpg")) + list(Path(frames_path).glob("*.png"))
-    images = sorted(images)
-    h, w = load_image(images[0], device).shape[2:4] if infer_res_size is None else infer_res_size
+    images = get_sorted_image_paths(frames_path, max_frames=max_frames)
+    if len(images) < 2:
+        raise ValueError(f"Need at least 2 frames in '{frames_path}' to compute trajectories.")
+    h, w = load_image(images[0], selected_device).shape[2:4] if infer_res_size is None else infer_res_size
     t = len(images)
 
-    model = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False).to(device).eval()
+    model = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False).to(selected_device).eval()
     transforms = Raft_Large_Weights.DEFAULT.transforms()
 
     masks, flows = get_flows_with_masks(
         model,
         transforms,
         frames_path,
-        device=device,
+        device=selected_device,
         add_missing_forward_warp=True,
         threshold=threshold,
         infer_res_size=infer_res_size,
+        max_frames=max_frames,
     )
 
     fflow, bflow = flows[0:1], flows[1:2], # forward and backward flows, 1 x (t-1) x 2 x h x w
 
-    upper_bound = torch.tensor([w, h], device=device) - 1
-    lower_bound = torch.tensor([0, 0], device=device)
+    upper_bound = torch.tensor([w, h], device=selected_device) - 1
+    lower_bound = torch.tensor([0, 0], device=selected_device)
     all_filtered_trajectories = torch.full((0, t, 2), device="cpu", fill_value=float("nan"))
     look_behind = True
 
 
     for starting_frame in tqdm(range(t - (min_trajectory_length - 1)), leave=False):
-        trajectories = torch.zeros((t - starting_frame, h, w, 2)).float().to(device) # all trajectories starting from starting_frame, (t) x h x w x 2
-        coords = rearrange(coords_grid(1, h, w, device=device), "d l h w -> d h w l", d=1, l=2) # h x w x 2
-        orig_coords = rearrange(coords_grid(1, h, w, device=device), "d l h w -> d h w l", d=1, l=2) # h x w x 2, for direct flow
+        trajectories = torch.zeros((t - starting_frame, h, w, 2)).float().to(selected_device) # all trajectories starting from starting_frame, (t) x h x w x 2
+        coords = rearrange(coords_grid(1, h, w, device=selected_device), "d l h w -> d h w l", d=1, l=2) # h x w x 2
+        orig_coords = rearrange(coords_grid(1, h, w, device=selected_device), "d l h w -> d h w l", d=1, l=2) # h x w x 2, for direct flow
 
         mask = ~masks[starting_frame]
         if look_behind:
             # look at all trajectories starting before starting_frame, and collect the valid coordinates in starting_frame that they pass through.
-            past_passed = all_filtered_trajectories[:, starting_frame].to(device) # (M x 2)
+            past_passed = all_filtered_trajectories[:, starting_frame].to(selected_device) # (M x 2)
             past_passed = past_passed[past_passed.isnan().any(dim=-1).logical_not()] # M' x 2
             past_passed = past_passed.round().long()
             past_passed = past_passed[((past_passed >= 0) & (past_passed <= upper_bound)).all(dim=-1)]
@@ -217,17 +250,19 @@ def save_trajectories(args):
             not_passed_through[past_passed[:, 1], past_passed[:, 0]] = False # set to False all locations that have existing trajectories passing through them.
             mask |= not_passed_through
 
-        trajectories[0] = torch.where(mask, coords.double(), float("nan")) # set trajectories[0] to nan in locations that already have existing trajectories (starting at previous frames) passing through them, t x h x w x 2
+        nan_coords = torch.full_like(coords, torch.nan)
+        trajectories[0] = torch.where(mask, coords, nan_coords) # set trajectories[0] to nan in locations that already have existing trajectories (starting at previous frames) passing through them, t x h x w x 2
         
         if filter_using_direct_flow:
             dflows, dflow_masks = compute_direct_flows_for_start_frame(
                 model=model,
                 trasnforms=transforms,
                 input_path=frames_path,
-                device=device,
+                device=selected_device,
                 threshold=threshold,
                 starting_frame=starting_frame,
                 infer_res_size=infer_res_size,
+                max_frames=max_frames,
             )
 
         for idx in tqdm(range(t - 1 - starting_frame), leave=False):
@@ -253,7 +288,7 @@ def save_trajectories(args):
                 err_dflow = (coords - dflow_coords).norm(dim=3)
                 err_dflow = err_dflow * (dflow_mask > 0.2).float() # filter out locations where direct flow is not reliable
                 mask = mask & (err_dflow.unsqueeze(-1) <  direct_flow_threshold)
-            trajectories[idx + 1] = torch.where(mask, coords.double(), float("nan")) # set trajectories[idx+1] to nan in locations where the trajectory don't exist anymore (due to cycle-consistency error).
+            trajectories[idx + 1] = torch.where(mask, coords, nan_coords) # set trajectories[idx+1] to nan in locations where the trajectory don't exist anymore (due to cycle-consistency error).
 
         padded_trajectories = F.pad(
             rearrange(trajectories, "t h w d -> h w d t"), (starting_frame, 0), mode="constant", value=float("nan")
@@ -262,7 +297,8 @@ def save_trajectories(args):
         one_nan_least = padded_trajectories.isnan().any(dim=-1)
         set_nans = repeat(one_nan_least, "T t -> T t 2")
         padded_trajectories[set_nans] = float("nan")
-        current_not_nan_traj = padded_trajectories[padded_trajectories.cpu().isnan().any(dim=-1).logical_not().sum(dim=-1).cuda() >= min_trajectory_length]
+        valid_lengths = padded_trajectories.isnan().any(dim=-1).logical_not().sum(dim=-1)
+        current_not_nan_traj = padded_trajectories[valid_lengths >= min_trajectory_length]
         all_filtered_trajectories = torch.cat([all_filtered_trajectories, current_not_nan_traj.cpu()], dim=0) # (N x t x 2), (M x t x 2) -> ((M+N) x t x 2)
 
     torch.save(all_filtered_trajectories, output_path)
@@ -277,6 +313,7 @@ if __name__ == "__main__":
     parser.add_argument("--min-trajectory-length", type=int, default=2, help="Minimum trajectory length")
     parser.add_argument("--filter-using-direct-flow", action="store_true", default=False, help="Filter using direct flow")
     parser.add_argument("--direct-flow-threshold", type=float, default=None, help="Threshold for direct flow error")
+    parser.add_argument("--max-frames", type=int, default=400, help="Maximum number of frames to process from the start of the sequence.")
 
     args = parser.parse_args()
     save_trajectories(args)

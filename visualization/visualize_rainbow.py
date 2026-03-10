@@ -4,13 +4,17 @@ from PIL import Image
 import os
 import numpy as np
 import torch
+import sys
 from kornia import morphology as morph
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils import add_config_paths
 import visualization.viz_utils_tapir as viz_utils
 from data.data_utils import load_video, save_video
-
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
+from device_utils import get_device
 
 # The inlier point threshold for ransac, specified in normalized coordinates
 # (points are rescaled to the range [0, 1] for optimization).
@@ -55,6 +59,7 @@ def filter_bg_trajectories_for_homographies(bg_tracjectories, bg_trajectories_co
 
 @torch.no_grad()
 def run(args):
+    device = get_device(log=True)
     config_paths = add_config_paths(args.data_path, {})
     video_folder = config_paths["video_folder"]
     masks_path = Path(config_paths["masks_path"])
@@ -70,6 +75,8 @@ def run(args):
     video_h, video_w = video.shape[1], video.shape[2]
 
     tracks = np.load(trajs_path) # [N, T, 2]
+    if tracks.shape[0] == 0:
+        raise ValueError(f"No grid tracks found in '{trajs_path}'. Run inference_grid.py first.")
     if args.infer_res_size is not None:
         pred_h, pred_w = args.infer_res_size
         tracks = tracks * np.array([video_w / pred_w, video_h / pred_h], dtype=np.float32) # resize tracks to video resolution
@@ -90,12 +97,19 @@ def run(args):
         segm_mask = morph.erosion(torch.from_numpy(segm_mask).float()[None, None], erosion_kernel).bool().squeeze()  # Erosion, H x W
 
     coords = tracks[:,0].round().astype(np.int32)
+    coords[:, 0] = np.clip(coords[:, 0], 0, segm_mask.shape[1] - 1)
+    coords[:, 1] = np.clip(coords[:, 1], 0, segm_mask.shape[0] - 1)
     is_fg = (segm_mask[coords[:, 1], coords[:, 0]] > 0)
+    if not np.any(is_fg):
+        print("No foreground tracks selected by the segmentation mask; falling back to all tracks.", flush=True)
+        is_fg = np.ones(tracks.shape[0], dtype=bool)
 
     vis_start_frame = args.vis_start_frame # default 0
-    vis_end_frame = args.vis_end_frame if args.vis_end_frame is not None else video.shape[0]
+    max_common_frames = min(video.shape[0], tracks.shape[1], occluded.shape[1])
+    vis_end_frame = args.vis_end_frame if args.vis_end_frame is not None else max_common_frames
+    vis_end_frame = min(vis_end_frame, max_common_frames)
     
-    video = video[vis_start_frame: vis_end_frame]
+    video = video[vis_start_frame:vis_end_frame]
     tracks = tracks[:, vis_start_frame:vis_end_frame]
     occluded = occluded[:, vis_start_frame:vis_end_frame]
 
@@ -108,36 +122,43 @@ def run(args):
     
     if args.plot_trails:
         # load background optical flow trajectories, used for homography estimation
-        bg_of_trajectories = torch.load(bg_of_trajectories_path).to(device)
+        bg_of_trajectories = torch.load(bg_of_trajectories_path, map_location=device).to(device)
         bg_of_trajectories = bg_of_trajectories[:, vis_start_frame:vis_end_frame]
         bg_of_tracks = filter_bg_trajectories_for_homographies(bg_of_trajectories, canonical_frame=args.canonical_frame)
+        if bg_of_tracks.shape[0] == 0:
+            print("No valid background trajectories for homography estimation; skipping rainbow trails.", flush=True)
+            print("Saved to", model_vis_dir)
+            return
         bg_of_occluded = bg_of_tracks.isnan().any(dim=-1).int().cpu().numpy()
         bg_of_tracks = np.nan_to_num(bg_of_tracks.cpu().numpy(), nan=0)
 
         of_h, of_w = args.of_res_size
         bg_of_tracks = bg_of_tracks * np.array([video_w / of_w, video_h / of_h], dtype=np.float32) # resize tracks to video resolution
 
-        homogs, err, canonical = viz_utils.get_homographies_wrt_frame(
-            bg_of_tracks,
-            bg_of_occluded,
-            [video_w, video_h],
-            thresh=ransac_inlier_threshold,
-            outlier_point_threshold=ransac_track_inlier_frac,
-            num_refinement_passes=num_refinement_passes,
-            reference_frame=args.canonical_frame
-        )
+        try:
+            homogs, err, canonical = viz_utils.get_homographies_wrt_frame(
+                bg_of_tracks,
+                bg_of_occluded,
+                [video_w, video_h],
+                thresh=ransac_inlier_threshold,
+                outlier_point_threshold=ransac_track_inlier_frac,
+                num_refinement_passes=num_refinement_passes,
+                reference_frame=args.canonical_frame
+            )
 
-        rainbow_video = viz_utils.plot_tracks_tails(
-            video,
-            tracks[is_fg],
-            occluded[is_fg],
-            homogs, 
-            point_size=args.point_size,
-            linewidth=args.linewidth,
-            marker="D",
-        )
-        rainbow_vis_name = f"rainbow_erosion_kernel_{args.erosion_kernel_size}_fps_{args.fps}.mp4" if args.erosion_kernel_size is not None else f"rainbow_fps_{args.fps}.mp4"
-        save_video(rainbow_video, os.path.join(model_vis_dir, rainbow_vis_name), fps=args.fps)
+            rainbow_video = viz_utils.plot_tracks_tails(
+                video,
+                tracks[is_fg],
+                occluded[is_fg],
+                homogs, 
+                point_size=args.point_size,
+                linewidth=args.linewidth,
+                marker="D",
+            )
+            rainbow_vis_name = f"rainbow_erosion_kernel_{args.erosion_kernel_size}_fps_{args.fps}.mp4" if args.erosion_kernel_size is not None else f"rainbow_fps_{args.fps}.mp4"
+            save_video(rainbow_video, os.path.join(model_vis_dir, rainbow_vis_name), fps=args.fps)
+        except np.linalg.LinAlgError as e:
+            print(f"Homography estimation failed ({e}); skipping rainbow trails.", flush=True)
     
     print("Saved to", model_vis_dir)
 

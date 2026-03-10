@@ -4,7 +4,13 @@ from torch.nn.functional import interpolate
 import numpy as np
 from PIL import Image
 import argparse
-device = "cuda" if torch.cuda.is_available() else "cpu"
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from device_utils import get_device
 
 def generate_start_end(trajectories):
     """Generates a start and end point for each trajectory
@@ -38,6 +44,10 @@ def generate_start_end(trajectories):
 def load_masks(masks_path, h_resize=476, w_resize=854):
     masks = []
     input_files = sorted(list(Path(masks_path).glob("*.jpg")) + list(Path(masks_path).glob("*.png")))
+    if len(input_files) == 0:
+        raise FileNotFoundError(
+            f"No mask images found in '{masks_path}'. Expected .jpg or .png mask frames."
+        )
     for mask_path in input_files:
         mask = np.array(Image.open(mask_path).convert("L")) # convert to grayscale if necessary
         masks.append(mask)
@@ -53,12 +63,13 @@ def load_masks(masks_path, h_resize=476, w_resize=854):
 
 
 def mask_filter_trajectories(traj_path, masks_path, out_path, filter_bg=False):
-    trajectories = torch.load(traj_path, map_location="cpu")
+    device = get_device()
+    trajectories = torch.load(traj_path, map_location=device)
     masks = load_masks(masks_path)
     
     batch_size = 1_000_000
     is_valid_traj_list = []
-    masks_t = torch.from_numpy(masks).cuda()
+    masks_t = torch.from_numpy(masks).to(device)
     for i in range(0, trajectories.shape[0], batch_size):
         end = min(i + batch_size, trajectories.shape[0])
         trajectories_batch = trajectories[i:end].to(device).clone()
@@ -78,6 +89,7 @@ def mask_filter_trajectories(traj_path, masks_path, out_path, filter_bg=False):
     print(f"Saved {out_path}, shape: {filtered_trajs.shape}")
 
 def split_trajectories_to_fg_bg(args):
+    get_device(log=True)
     mask_filter_trajectories(args.traj_path, args.fg_masks_path, args.fg_traj_path, filter_bg=False)
     mask_filter_trajectories(args.traj_path, args.fg_masks_path, args.bg_traj_path, filter_bg=True)
     

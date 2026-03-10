@@ -2,11 +2,19 @@ import argparse
 import os
 import torch
 import yaml
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from data.data_utils import load_video
 from utils import add_config_paths, get_dino_features_video
-device = "cuda" if torch.cuda.is_available() else "cpu"
+from device_utils import get_device
 
 def save_dino_embed_video(args):
+    device = get_device(log=True)
     config_paths = add_config_paths(args.data_path, {})
     video_folder = config_paths["video_folder"]
     dino_embed_video_path = config_paths["dino_embed_video_path"] if not args.for_mask else config_paths["mask_dino_embed_video_path"]
@@ -15,10 +23,18 @@ def save_dino_embed_video(args):
     dino_facet = config["dino_facet"]if not args.for_mask else config["mask_dino_facet"]
     dino_layer = config["dino_layer"]if not args.for_mask else config["mask_dino_layer"]
     dino_stride = config["dino_stride"]if not args.for_mask else config["mask_dino_stride"]
+    max_frames = config.get("max_frames", 400)
     h, w = config["video_resh"], config["video_resw"]
     
-    video = load_video(video_folder=video_folder, resize=(h, w), num_frames=400).to(device) # T x 3 x H x W
-    dino_embed_video = get_dino_features_video(video=video, model_name=dino_model_name, facet=dino_facet, stride=dino_stride, layer=dino_layer).to(device).detach() # T x C' x H' x W'
+    video = load_video(video_folder=video_folder, resize=(h, w), num_frames=max_frames).to(device) # T x 3 x H x W
+    dino_embed_video = get_dino_features_video(
+        video=video,
+        model_name=dino_model_name,
+        facet=dino_facet,
+        stride=dino_stride,
+        layer=dino_layer,
+        device=device,
+    ).to(device).detach() # T x C' x H' x W'
 
     os.makedirs(os.path.dirname(dino_embed_video_path), exist_ok=True)
     torch.save(dino_embed_video, dino_embed_video_path)

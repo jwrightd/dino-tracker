@@ -1,12 +1,13 @@
 import torch
+from device_utils import get_device
 
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
-
-def create_meshgrid(h, w, step=7, patch_size=14, return_hw=False):
+def create_meshgrid(h, w, step=7, patch_size=14, return_hw=False, device=None):
+        if device is None:
+            device = get_device()
         start_coord = patch_size//2
         x = torch.arange(start_coord, w, step=step, device=device).float()
         y = torch.arange(start_coord, h, step=step, device=device).float()
-        yy, xx = torch.meshgrid(y, x)
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
         xx = xx.reshape(-1)
         yy = yy.reshape(-1)
         grid = torch.stack([xx, yy], dim=-1)

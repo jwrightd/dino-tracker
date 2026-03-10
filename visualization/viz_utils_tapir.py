@@ -26,6 +26,23 @@ import mediapy as media
 import numpy as np
 
 
+def _figure_to_rgb(fig):
+  """Convert a Matplotlib figure canvas to an RGB uint8 image across backends."""
+  fig.canvas.draw()
+  width, height = fig.get_size_inches() * fig.get_dpi()
+  if hasattr(fig.canvas, "tostring_rgb"):
+    img = np.frombuffer(fig.canvas.tostring_rgb(), dtype="uint8").reshape(
+        int(height), int(width), 3
+    )
+    return img
+
+  # macOS FigureCanvasMac uses RGBA buffer APIs.
+  rgba = np.asarray(fig.canvas.buffer_rgba())
+  if rgba.shape[-1] == 4:
+    return rgba[..., :3].copy()
+  return rgba.copy()
+
+
 # Generate random colormaps for visualizing different points.
 def get_colors(num_colors: int) -> List[Tuple[int, int, int]]:
   """Gets colormap for points."""
@@ -165,6 +182,9 @@ def plot_tracks_v2(
   Returns:
     video: [num_frames, height, width, 3], np.uint8, [0, 255]
   """
+  if points.shape[0] == 0:
+    return np.copy(rgb)
+
   disp = []
   cmap = plt.cm.hsv  # pytype: disable=module-attr
 
@@ -182,7 +202,6 @@ def plot_tracks_v2(
     colors = np.concatenate([colors_arr, np.ones((colors_arr.shape[0], 1))], axis=1)
   figure_dpi = 64
 
-  figs = []
   for i in range(rgb.shape[0]):
     fig = plt.figure(
         figsize=(rgb.shape[2] / figure_dpi, rgb.shape[1] / figure_dpi),
@@ -190,7 +209,6 @@ def plot_tracks_v2(
         frameon=False,
         facecolor='w',
     )
-    figs.append(fig)
     ax = fig.add_subplot()
     ax.axis('off')
     ax.imshow(rgb[i] / 255.0)
@@ -224,14 +242,8 @@ def plot_tracks_v2(
 
     plt.subplots_adjust(top=1, bottom=0, right=1, left=0, hspace=0, wspace=0)
     plt.margins(0, 0)
-    fig.canvas.draw()
-    width, height = fig.get_size_inches() * fig.get_dpi()
-    img = np.frombuffer(fig.canvas.tostring_rgb(), dtype='uint8').reshape(
-        int(height), int(width), 3
-    )
+    img = _figure_to_rgb(fig)
     disp.append(np.copy(img))
-
-  for fig in figs:
     plt.close(fig)
   return np.stack(disp, axis=0)
 
@@ -626,7 +638,10 @@ def get_homographies_wrt_frame(
         #
         # But don't do that on the last iteration because it causes an obvious
         # jump (i.e. allow the solution to collapse a little at the end).
-        inv_homog = np.linalg.inv(homog)
+        try:
+          inv_homog = np.linalg.inv(homog)
+        except np.linalg.LinAlgError:
+          inv_homog = np.linalg.pinv(homog)
         for fr2 in range(pts.shape[0]):
           res_homog[fr2] = inv_homog @ res_homog[fr2]
           _, _, tformed = compute_inliers(
@@ -688,6 +703,9 @@ def plot_tracks_tails(
   Returns:
     frames: rgb frames with rendered rainbow tracks.
   """
+  if points.shape[0] == 0:
+    return np.copy(rgb)
+
   disp = []
   cmap = plt.cm.hsv  # pytype: disable=module-attr
 
@@ -700,7 +718,6 @@ def plot_tracks_tails(
 
   figure_dpi = 64
 
-  figs = []
   for i in range(rgb.shape[0]):
     print(f'Plotting frame {i}...')
     fig = plt.figure(
@@ -709,7 +726,6 @@ def plot_tracks_tails(
         frameon=False,
         facecolor='w',
     )
-    figs.append(fig)
     ax = fig.add_subplot()
     ax.axis('off')
     ax.imshow(rgb[i] / 255.0)
@@ -721,13 +737,17 @@ def plot_tracks_tails(
     plt.scatter(points[:, i, 0], points[:, i, 1], s=point_size, c=colalpha, marker=marker)
     reference = points[:, i]
     reference_occ = occluded[:, i : i + 1]
+    try:
+      inv_h_i = np.linalg.inv(homogs[i])
+    except np.linalg.LinAlgError:
+      inv_h_i = np.linalg.pinv(homogs[i])
     for j in range(i - 1, -1, -1):
       points_homo = np.concatenate(
           [points[:, j], np.ones_like(points[:, j, 0:1])], axis=1
       )
       points_transf = np.transpose(
           np.matmul(
-              np.matmul(np.linalg.inv(homogs[i]), homogs[j]),
+              np.matmul(inv_h_i, homogs[j]),
               np.transpose(points_homo),
           )
       )
@@ -768,13 +788,7 @@ def plot_tracks_tails(
 
     plt.subplots_adjust(top=1, bottom=0, right=1, left=0, hspace=0, wspace=0)
     plt.margins(0, 0)
-    fig.canvas.draw()
-    width, height = fig.get_size_inches() * fig.get_dpi()
-    img = np.frombuffer(fig.canvas.tostring_rgb(), dtype='uint8').reshape(
-        int(height), int(width), 3
-    )
+    img = _figure_to_rgb(fig)
     disp.append(np.copy(img))
-
-  for fig in figs:
     plt.close(fig)
   return np.stack(disp, axis=0)

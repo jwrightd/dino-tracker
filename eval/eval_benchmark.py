@@ -3,6 +3,13 @@ from tqdm import tqdm
 import pandas as pd
 import os
 import pickle
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from eval.metrics import compute_tapvid_metrics_for_video, compute_badja_metrics_for_video
 
 

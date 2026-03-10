@@ -5,10 +5,6 @@ from einops import rearrange
 import math
 from models.networks.conv_norm import NormalizedConv2d
 
-
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-
 # copied from OmniMotion
 def gen_grid(h_start, w_start, h_end, w_end, step_h, step_w, device, normalize=False, homogeneous=False):
     """Generate a grid of coordinates in the image frame.
@@ -24,7 +20,7 @@ def gen_grid(h_start, w_start, h_end, w_end, step_h, step_w, device, normalize=F
     else:
         lin_y = torch.arange(h_start, h_end, step=step_h, device=device)
         lin_x = torch.arange(w_start, w_end, step=step_w, device=device)
-    grid_y, grid_x = torch.meshgrid((lin_y, lin_x))
+    grid_y, grid_x = torch.meshgrid((lin_y, lin_x), indexing="ij")
     grid = torch.stack((grid_x, grid_y), -1)
     if homogeneous:
         grid = torch.cat([grid, torch.ones_like(grid[..., :1])], dim=-1)
@@ -109,7 +105,10 @@ class TrackerHead(nn.Module):
         cost_volume: shape (B, C, H, W)
         """
         
-        range_normalizer = RangeNormalizer(shapes=(self.video_w, self.video_h)) # shapes are (W, H), correpsonding to (x, y) coordinates
+        range_normalizer = RangeNormalizer(
+            shapes=(self.video_w, self.video_h),
+            device=cost_volume.device,
+        ) # shapes are (W, H), correpsonding to (x, y) coordinates
         
         # crop heatmap around argmax point
         argmax_flat = torch.argmax(rearrange(cost_volume[:, 0], "b h w -> b (h w)"), dim=1)

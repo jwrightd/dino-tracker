@@ -5,6 +5,7 @@ import torchvision.transforms as T
 
 from models.extractor import VitExtractor
 import os
+from device_utils import clear_device_cache, get_device, grid_sample_border_safe
 
 
 def add_config_paths(data_path, config):
@@ -30,17 +31,19 @@ def add_config_paths(data_path, config):
 
 
 @torch.no_grad()
-def get_dino_features_video(video, model_name="dinov2_vitb14", facet='tokens', stride=7, layer=None, device: str = 'cuda:0'):
+def get_dino_features_video(video, model_name="dinov2_vitb14", facet='tokens', stride=7, layer=None, device=None):
     """
     Args:
         video (torch.tensor): Tensor of the input video, of shape: T x 3 x H x W.
             T- number of frames. C- number of RGB channels (most likely 3), W- width, H- height.
-        device (str, optional):indicating device type. Defaults to 'cuda:0'.
+        device (torch.device, optional): device where DINO features are computed.
 
     Returns:
         dino_keys_video: DINO keys from last layer for each frame. Shape: (T x C x H//8 x W//8).
             T- number of frames. C - DINO key embedding dimension for patch.
     """
+    if device is None:
+        device = get_device()
     dino_extractor = VitExtractor(model_name=model_name, device=device, stride=stride)
     dino_extractor = dino_extractor.eval().to(device)
     imagenet_norm = T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
@@ -67,7 +70,7 @@ def get_dino_features_video(video, model_name="dinov2_vitb14", facet='tokens', s
         dino_features_video[i] = features.cpu()
     # interpolate to the original video length
     del dino_extractor
-    torch.cuda.empty_cache()
+    clear_device_cache(device)
     gc.collect()
     return dino_features_video
 
@@ -98,4 +101,4 @@ def bilinear_interpolate_video(video:torch.tensor, points:torch.tensor, h:int, w
         if t > 1:
             samples[:, :, :, :, 2] = samples[:, :, :, :, 2] / (t - 1)  # normalize to [0,1]
         samples[:, :, :, :, 2] = samples[:, :, :, :, 2] * 2 - 1  # normalize to [-1,1]
-    return torch.nn.functional.grid_sample(video, samples, align_corners=True, padding_mode ='border') # points out-of bounds are padded with border values
+    return grid_sample_border_safe(video, samples, align_corners=True) # points out-of-bounds are padded with border values

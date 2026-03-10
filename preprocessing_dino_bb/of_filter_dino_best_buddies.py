@@ -1,10 +1,16 @@
 import os 
-from preprocessing_dino_bb.dino_bb_utils import create_meshgrid
 import torch
 import argparse
+import sys
+from pathlib import Path
 from tqdm import tqdm
 
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from preprocessing_dino_bb.dino_bb_utils import create_meshgrid
+from device_utils import clear_device_cache, get_device
 
 def get_closest_traj_idx_batch(trajectories, points, t, batch_size=100):
     """ 
@@ -35,6 +41,7 @@ def is_point_valid(point):
 
 @torch.no_grad()
 def run(args):
+    device = get_device(log=True)
     
     dino_bb_path = args.dino_bb_path
     traj_path = args.traj_path
@@ -42,13 +49,13 @@ def run(args):
     dino_bb_stride = args.dino_bb_stride
     h, w = args.h, args.w
     
-    bb_data = torch.load(dino_bb_path)
-    traj = torch.load(traj_path).to(device)
+    bb_data = torch.load(dino_bb_path, map_location=device)
+    traj = torch.load(traj_path, map_location=device).to(device)
 
     # pre-compute closest traj indices for each point
     video_len = traj.shape[1]
     # grid, w_grid, h_grid = create_meshgrid(h, w, step=dino_bb_stride, return_hw=True)
-    grid, h_grid, w_grid = create_meshgrid(h, w, step=dino_bb_stride, return_hw=True)
+    grid, h_grid, w_grid = create_meshgrid(h, w, step=dino_bb_stride, return_hw=True, device=device)
     closest_traj_idx_grid_dict = {}
     for t in tqdm(range(video_len), desc="pre-computing trajectory indices"):
         closest_traj_idx = get_closest_traj_idx_batch(traj, grid, t, 30) # B, that is, len(grid)
@@ -56,7 +63,7 @@ def run(args):
         closest_traj_idx_grid_dict[t] = closest_traj_idx_grid
     # free up memory
     traj = traj.cpu()
-    torch.cuda.empty_cache()
+    clear_device_cache(device)
 
     total_filtered_bb = {}
     traj_is_point_invalid = traj.isnan().any(dim=-1).to(device) # N x T

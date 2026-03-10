@@ -2,9 +2,15 @@ import argparse
 import numpy as np
 import torch
 import torch.nn.functional as F
-from data.data_utils import save_video_frames
+import sys
+from pathlib import Path
 
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from data.data_utils import save_video_frames
+from device_utils import get_device
 
 
 
@@ -19,6 +25,8 @@ def get_fg_mask_from_pca(
     """
     feature_map: (1, H, W, C) is the feature map of a single image.
     """
+    # MPS currently lacks linalg_qr used by pca_lowrank; run PCA on CPU.
+    feature_map = feature_map.cpu()
     if len(feature_map.shape) == 3:
         # make it (1, h, w, C)
         feature_map = feature_map[None]
@@ -49,7 +57,10 @@ class Namespace:
 
 @torch.no_grad()
 def run(args):
-    dino_embed_video = torch.load(args.dino_embed_video_path) # T x C x H x W
+    device = get_device(log=True)
+    if device.type == "mps":
+        print("Using CPU for FG-mask PCA (MPS linalg_qr is unsupported).", flush=True)
+    dino_embed_video = torch.load(args.dino_embed_video_path, map_location="cpu") # T x C x H x W
     res = (args.h, args.w)
 
     fg_mask = get_fg_mask_from_pca(feature_map=dino_embed_video.permute(0, 2, 3, 1), 

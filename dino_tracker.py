@@ -13,24 +13,101 @@ from data.data_utils import load_video
 from data.dataset import DinoTrackerSampler, RangeNormalizer
 from preprocessing.split_trajectories_to_fg_bg import load_masks
 from utils import add_config_paths
-
-
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
-
-
+from device_utils import clear_device_cache, get_device
 
 class DINOTracker():
     def __init__(self, args):
+        self.device = get_device(log=True)
+        self.config_path = args.config
+        self.data_path = args.data_path
+        self.preprocessing_config_path = os.path.join(os.path.dirname(self.config_path), "preprocessing.yaml")
         
         self.load_config(args.config)
         self.set_paths(args.data_path)
 
         self.orig_video_res_h, self.orig_video_res_w, video_rest = self.get_original_video_res(self.video_path)
-        self.range_normalizer = RangeNormalizer(shapes=(self.config["video_resw"], self.config["video_resh"], video_rest)).to(device) # nn.Module
+        self.range_normalizer = RangeNormalizer(
+            shapes=(self.config["video_resw"], self.config["video_resh"], video_rest),
+            device=self.device,
+        ).to(self.device) # nn.Module
         self.of_loss_fn = torch.nn.HuberLoss(delta=1/32, reduction='none')
+        self.train_num_frames = None
+
+    def _set_range_normalizer(self, video_t: int):
+        self.range_normalizer = RangeNormalizer(
+            shapes=(self.config["video_resw"], self.config["video_resh"], video_t),
+            device=self.device,
+        ).to(self.device)
+
+    def _get_range_normalizer_t(self):
+        return int(self.range_normalizer.normalizer[2].item() + 1)
+
+    def _count_images_in_dir(self, path):
+        return len(list(Path(path).glob("*.jpg")) + list(Path(path).glob("*.png")))
+
+    def _get_model_num_frames(self):
+        candidates = []
+
+        config_max_frames = self.config.get("max_frames", None)
+        if config_max_frames is not None:
+            candidates.append(int(config_max_frames))
+
+        n_video_frames = self._count_images_in_dir(self.video_path)
+        if n_video_frames > 0:
+            candidates.append(n_video_frames)
+
+        # Preprocessing artifacts (masks) usually match dino/trajectory frame count.
+        n_mask_frames = self._count_images_in_dir(self.fg_masks_path) if os.path.exists(self.fg_masks_path) else 0
+        if n_mask_frames > 0:
+            candidates.append(n_mask_frames)
+
+        if self.train_num_frames is not None:
+            candidates.append(int(self.train_num_frames))
+
+        if len(candidates) == 0:
+            return None
+        return min(candidates)
+
+    def validate_training_inputs(self):
+        missing_paths = []
+        required_paths = [
+            self.video_path,
+            self.fg_masks_path,
+            self.dino_embed_path,
+            self.fg_trajectories_path,
+            self.bg_trajectories_path,
+            self.dino_bb_path,
+        ]
+        for path in required_paths:
+            if not os.path.exists(path):
+                missing_paths.append(path)
+
+        if missing_paths:
+            missing = "\n".join(f"- {p}" for p in missing_paths)
+            preprocessing_config = self.preprocessing_config_path if os.path.exists(self.preprocessing_config_path) else "./config/preprocessing.yaml"
+            raise FileNotFoundError(
+                "Missing required training inputs:\n"
+                f"{missing}\n\n"
+                f"Run preprocessing first:\n"
+                f"python ./preprocessing/main_preprocessing.py --config {preprocessing_config} --data-path {self.data_path}"
+            )
+
+        n_video_frames = self._count_images_in_dir(self.video_path)
+        if n_video_frames == 0:
+            raise FileNotFoundError(
+                f"No video frames found in '{self.video_path}'. Expected .jpg or .png files."
+            )
+        n_mask_frames = self._count_images_in_dir(self.fg_masks_path)
+        if n_mask_frames == 0:
+            preprocessing_config = self.preprocessing_config_path if os.path.exists(self.preprocessing_config_path) else "./config/preprocessing.yaml"
+            raise FileNotFoundError(
+                f"No mask frames found in '{self.fg_masks_path}'. Expected .jpg or .png files.\n\n"
+                f"Run preprocessing first:\n"
+                f"python ./preprocessing/main_preprocessing.py --config {preprocessing_config} --data-path {self.data_path}"
+            )
         
     def load_fg_masks(self):
-        self.fg_masks = torch.from_numpy(load_masks(self.fg_masks_path, h_resize=self.config["video_resh"])).to(device)        
+        self.fg_masks = torch.from_numpy(load_masks(self.fg_masks_path, h_resize=self.config["video_resh"])).to(self.device)        
     
     def set_paths(self, data_path):
         config_paths = add_config_paths(data_path, {})
@@ -63,31 +140,63 @@ class DINOTracker():
     def load_trajectories(self):
         assert os.path.exists(self.fg_trajectories_path) & os.path.exists(self.bg_trajectories_path), "trajectory files don't exist"
         
-        trj_device = torch.device('cpu') if self.config['keep_traj_in_cpu'] else device
+        trj_device = torch.device('cpu') if self.config['keep_traj_in_cpu'] else self.device
         train_fg_trajectories = torch.load(self.fg_trajectories_path, map_location=trj_device)
         train_bg_trajectories = torch.load(self.bg_trajectories_path, map_location=trj_device)
         return train_fg_trajectories, train_bg_trajectories
     
     def load_dino_best_buddies(self):
-        self.dino_bb_pairs = torch.load(self.dino_bb_path, map_location=device)
+        self.dino_bb_pairs = torch.load(self.dino_bb_path, map_location=self.device)
     
     def get_sampler(self):        
         train_fg_trajectories, train_bg_trajectories = self.load_trajectories()
+        self.train_num_frames = int(train_fg_trajectories.shape[1])
+        if self._get_range_normalizer_t() != self.train_num_frames:
+            self._set_range_normalizer(self.train_num_frames)
+            print(f"Using {self.train_num_frames} frames for training.", flush=True)
+
+        # MPS can intermittently fail on very large advanced-indexing ops used by the sampler.
+        # Keep sampler tensors/selection on CPU for stability, then move sampled batches to self.device.
+        sampler_device = self.device
+        sampler_keep_in_cpu = self.config['keep_traj_in_cpu']
+        sampler_range_normalizer = self.range_normalizer
+        if self.device.type == "mps":
+            sampler_device = torch.device("cpu")
+            sampler_keep_in_cpu = True
+            train_fg_trajectories = train_fg_trajectories.cpu()
+            train_bg_trajectories = train_bg_trajectories.cpu()
+            sampler_range_normalizer = RangeNormalizer(
+                shapes=(self.config["video_resw"], self.config["video_resh"], self.train_num_frames),
+                device=sampler_device,
+            ).to(sampler_device)
+            print("Using CPU sampler backend for trajectory indexing stability on MPS.", flush=True)
+
         train_sampler = DinoTrackerSampler(fg_trajectories=train_fg_trajectories,
                                            bg_trajectories=train_bg_trajectories,
                                            fg_traj_ratio=self.config["fg_traj_ratio"],
                                            batch_size=self.config["train_batch_size"],
-                                           range_normalizer=self.range_normalizer,
+                                           range_normalizer=sampler_range_normalizer,
                                            dst_range=(-1, 1),
                                            num_frames=self.config["batch_n_frames"],
-                                           keep_in_cpu=self.config['keep_traj_in_cpu'])
+                                           keep_in_cpu=sampler_keep_in_cpu,
+                                           device=sampler_device)
         return train_sampler
     
     def get_model(self):
-        video = load_video(video_folder=self.video_path, resize=(self.config["video_resh"], self.config["video_resw"])).to(device)
+        num_frames = self._get_model_num_frames()
+        if num_frames is not None:
+            print(f"Loading first {num_frames} frames into model video tensor.", flush=True)
+
+        video = load_video(
+            video_folder=self.video_path,
+            resize=(self.config["video_resh"], self.config["video_resw"]),
+            num_frames=num_frames,
+        ).to(self.device)
+        if self._get_range_normalizer_t() != video.shape[0]:
+            self._set_range_normalizer(video.shape[0])
         tracker_args = {
             "video":video,
-            "device":device,
+            "device":self.device,
             "dino_embed_path": self.dino_embed_path,
             "dino_patch_size": self.config["dino_patch_size"],
             "stride":self.config["stride"],
@@ -99,7 +208,7 @@ class DINOTracker():
             "cyc_thresh": self.config["cyc_thresh"]
         }
         
-        model = Tracker(**tracker_args).to(device)
+        model = Tracker(**tracker_args).to(self.device)
             
         self.init_iter = get_last_ckpt_iter(self.ckpt_folder)
         if self.init_iter > 0:
@@ -126,8 +235,13 @@ class DINOTracker():
     
     def get_inputs_and_labels(self, sampler):
         sample = sampler()
-        labels = sample["t2_points_normalized"][:, :-1]
-        inputs = (sample["t1_points"], sample["source_frame_indices"], sample["target_frame_indices"], sample["frames_set_t"])
+        labels = sample["t2_points_normalized"][:, :-1].to(self.device)
+        inputs = (
+            sample["t1_points"].to(self.device),
+            sample["source_frame_indices"].to(self.device),
+            sample["target_frame_indices"].to(self.device),
+            sample["frames_set_t"].to(self.device),
+        )
         return inputs, labels
     
     def set_model_train(self, model):
@@ -190,18 +304,43 @@ class DINOTracker():
                                                                                             resh=model.video.shape[-2])
             bg_mask_source = ~fg_mask_source
             source_coords_bg, target_coords_bg = best_buddies['source_coords'][bg_mask_source], best_buddies['target_coords'][bg_mask_source]
-            fg_indices = torch.arange(best_buddies['source_coords'].shape[0], device=device)[fg_mask_source]
-            bg_indices = torch.arange(best_buddies['source_coords'].shape[0], device=device)[bg_mask_source]
+            bb_device = best_buddies["source_coords"].device
+            fg_indices = torch.arange(best_buddies['source_coords'].shape[0], device=bb_device)[fg_mask_source]
+            bg_indices = torch.arange(best_buddies['source_coords'].shape[0], device=bb_device)[bg_mask_source]
             
-            source_coords_fg = torch.cat([source_coords_fg, torch.tensor([source_frame_idx] * source_coords_fg.shape[0]).unsqueeze(1).cuda()], dim=1)
-            target_coords_fg = torch.cat([target_coords_fg, torch.tensor([target_frame_idx] * target_coords_fg.shape[0]).unsqueeze(1).cuda()], dim=1)
-            fg_selector = torch.randperm(source_coords_fg.shape[0])[:BATCH_SIZE_FG]
+            source_coords_fg = torch.cat(
+                [
+                    source_coords_fg,
+                    source_frame_idx.repeat(source_coords_fg.shape[0]).unsqueeze(1).to(dtype=source_coords_fg.dtype),
+                ],
+                dim=1,
+            )
+            target_coords_fg = torch.cat(
+                [
+                    target_coords_fg,
+                    target_frame_idx.repeat(target_coords_fg.shape[0]).unsqueeze(1).to(dtype=target_coords_fg.dtype),
+                ],
+                dim=1,
+            )
+            fg_selector = torch.randperm(source_coords_fg.shape[0], device=source_coords_fg.device)[:BATCH_SIZE_FG]
             source_coords_fg_sampled = source_coords_fg[fg_selector]
             target_coords_fg_sampled = target_coords_fg[fg_selector]
             
-            source_coords_bg = torch.cat([source_coords_bg, torch.tensor([source_frame_idx] * source_coords_bg.shape[0]).unsqueeze(1).cuda()], dim=1)
-            target_coords_bg = torch.cat([target_coords_bg, torch.tensor([target_frame_idx] * target_coords_bg.shape[0]).unsqueeze(1).cuda()], dim=1)
-            bg_selector = torch.randperm(source_coords_bg.shape[0])[:BATCH_SIZE_BG]
+            source_coords_bg = torch.cat(
+                [
+                    source_coords_bg,
+                    source_frame_idx.repeat(source_coords_bg.shape[0]).unsqueeze(1).to(dtype=source_coords_bg.dtype),
+                ],
+                dim=1,
+            )
+            target_coords_bg = torch.cat(
+                [
+                    target_coords_bg,
+                    target_frame_idx.repeat(target_coords_bg.shape[0]).unsqueeze(1).to(dtype=target_coords_bg.dtype),
+                ],
+                dim=1,
+            )
+            bg_selector = torch.randperm(source_coords_bg.shape[0], device=source_coords_bg.device)[:BATCH_SIZE_BG]
             source_coords_bg_sampled = source_coords_bg[bg_selector]
             target_coords_bg_sampled = target_coords_bg[bg_selector]
             selector = torch.cat([fg_indices[fg_selector], bg_indices[bg_selector]])
@@ -297,8 +436,8 @@ class DINOTracker():
             target_bb_f_bg = target_f[target_bb_indices][~fg_mask_source]
             
             # select random pairs
-            fg_selector = torch.randperm(source_bb_f_fg.shape[0])[:BATCH_SIZE_FG]
-            bg_selector = torch.randperm(target_bb_f_bg.shape[0])[:BATCH_SIZE_BG]
+            fg_selector = torch.randperm(source_bb_f_fg.shape[0], device=source_bb_f_fg.device)[:BATCH_SIZE_FG]
+            bg_selector = torch.randperm(target_bb_f_bg.shape[0], device=target_bb_f_bg.device)[:BATCH_SIZE_BG]
             source_bb_f_fg_sampled = source_bb_f_fg[fg_selector]
             target_bb_f_fg_sampled = target_bb_f_fg[fg_selector]
             source_bb_f_bg_sampled = source_bb_f_bg[bg_selector]
@@ -390,6 +529,7 @@ class DINOTracker():
         self.init_losses()
 
     def train(self):
+        self.validate_training_inputs()
         self.load_fg_masks()
         # Get values from config
         total_iterations = self.config["total_iterations"]
@@ -403,7 +543,7 @@ class DINOTracker():
         self.init_losses()
         
         for i in tqdm(range(self.init_iter, total_iterations)):
-            torch.cuda.empty_cache()
+            clear_device_cache(self.device)
             optimizer.zero_grad()
             inputs, labels = self.get_inputs_and_labels(train_sampler)
             

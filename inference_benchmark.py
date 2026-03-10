@@ -6,12 +6,12 @@ import argparse
 from dino_tracker import DINOTracker
 from data.tapvid import get_query_points_from_benchmark_config
 from models.model_inference import ModelInference
-
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
+from device_utils import get_device
 
 
 @torch.no_grad()
 def run(args):
+    device = get_device(log=True)
     dino_tracker = DINOTracker(args)
     model = dino_tracker.get_model()
     if args.iter is not None:

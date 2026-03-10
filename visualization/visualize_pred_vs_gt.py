@@ -1,9 +1,15 @@
 import argparse
 import os
 import pickle
+import sys
 from tqdm import tqdm
 import cv2
 import numpy as np
+
+from pathlib import Path
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from data.data_utils import load_video, save_video
 from data.tapvid import get_video_config_by_video_id

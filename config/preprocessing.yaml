@@ -1,6 +1,7 @@
 # --- OF trajectories config ---
 video_resh: 476
 video_resw: 854
+max_frames: 400
 min_trajectory_length: 2
 threshold: 1.5
 filter_using_direct_flow: true

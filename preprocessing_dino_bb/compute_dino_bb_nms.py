@@ -1,16 +1,47 @@
 import argparse
 import os
 import torch
+import sys
+from pathlib import Path
 from torchvision.ops import batched_nms #, nms
-from torch import einsum
 from tqdm import tqdm
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from preprocessing_dino_bb.dino_bb_utils import create_meshgrid, xy_to_fxy
+from device_utils import get_device
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+
+def _compute_source_target_sim_flat(source_f, target_fmap, chunk_size=1024):
+    """
+    source_f: C x N
+    target_fmap: C x H x W
+    returns: N x (H*W) cosine similarities
+    """
+    c = source_f.shape[0]
+    target_flat = target_fmap.reshape(c, -1)  # C x HW
+    target_norm = torch.clamp(target_flat.norm(dim=0, keepdim=True), min=1e-08)
+    target_flat = target_flat / target_norm
+
+    n = source_f.shape[1]
+    sims = []
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        source_chunk = source_f[:, start:end]  # C x chunk
+        source_norm = torch.clamp(source_chunk.norm(dim=0, keepdim=True), min=1e-08)
+        source_chunk = source_chunk / source_norm
+        sim_chunk = source_chunk.transpose(0, 1) @ target_flat  # chunk x HW
+        sims.append(sim_chunk)
+
+    return torch.cat(sims, dim=0)
 
 
-def get_bb_sim_indices(affs_batched, coords, box_size=50, iou_thresh=0.5, topk=400, device=device):
+def get_bb_sim_indices(affs_batched, coords, box_size=50, iou_thresh=0.5, topk=400, device=None):
     """  affs_batched: B x N """
+    if device is None:
+        device = affs_batched.device
     topk = torch.topk(affs_batched, k=topk, sorted=False, dim=1)
     filt_idx = topk.indices # B x topk
     affs_filt = topk.values # B x topk
@@ -43,20 +74,18 @@ def get_bb_sim_indices(affs_batched, coords, box_size=50, iou_thresh=0.5, topk=4
     return None, top2_values, r
 
 
-def compute_bb_nms(dino_bb_sf_tf, sf, tf, dino_emb, coords, stride, box_size, iou_thresh):
+def compute_bb_nms(dino_bb_sf_tf, sf, tf, dino_emb, coords, stride, box_size, iou_thresh, affinity_chunk_size=1024):
     source_xy = dino_bb_sf_tf['source_coords']
     source_fxy = xy_to_fxy(source_xy, stride=stride) # N x 2
 
     target_fmap = dino_emb[tf] # C x H x W
     source_f = dino_emb[sf, :, source_fxy[:, 1].int(), source_fxy[:, 0].int()] # C x N
-    
-    source_target_sim = einsum('cn,chw->nhw', source_f, target_fmap)
-    source_f_norm = torch.norm(source_f, dim=0) # N
-    target_fmap_norm = torch.norm(target_fmap, dim=0) # H x W
-    source_target_sim /= torch.clamp(source_f_norm[:, None, None] * target_fmap_norm[None, :, :], min=1e-08) # N x H x W
-    N = source_target_sim.shape[0]
 
-    source_target_sim_flat = source_target_sim.reshape(N, -1) # N x (HxW)
+    source_target_sim_flat = _compute_source_target_sim_flat(
+        source_f=source_f,
+        target_fmap=target_fmap,
+        chunk_size=affinity_chunk_size,
+    ) # N x (HxW)
     
     _, peak_aff, r = get_bb_sim_indices(source_target_sim_flat, coords, box_size=box_size, iou_thresh=iou_thresh)
     dino_bb_sf_tf['peak_coords'] = None
@@ -79,9 +108,27 @@ def compute_max_r(bb, bb_rev):
 
 
 def run(args):
-    dino_bb = torch.load(args.dino_bb_path) # { 'i_j': { source_coords: [N x 2] } }
-    dino_emb = torch.load(args.dino_emb_path) # t x c x h x w
-    coords = create_meshgrid(h=476, w=854, step=args.stride) # N x 2
+    device = get_device(log=True)
+    compute_device = device
+    if device.type == "mps":
+        compute_device = torch.device("cpu")
+        print("MPS detected: using CPU for DINO-BB NMS compatibility.", flush=True)
+
+    if compute_device.type == "cpu" and args.num_cpu_threads is not None:
+        torch.set_num_threads(args.num_cpu_threads)
+        try:
+            torch.set_num_interop_threads(max(1, args.num_cpu_threads // 2))
+        except RuntimeError:
+            # Can raise if interop threads were already initialized in this process.
+            pass
+        print(
+            f"Using CPU threads: intra_op={torch.get_num_threads()}, inter_op={torch.get_num_interop_threads()}",
+            flush=True,
+        )
+
+    dino_bb = torch.load(args.dino_bb_path, map_location=compute_device) # { 'i_j': { source_coords: [N x 2] } }
+    dino_emb = torch.load(args.dino_emb_path, map_location=compute_device) # t x c x h x w
+    coords = create_meshgrid(h=args.h, w=args.w, step=args.stride, device=compute_device) # N x 2
 
     for key in tqdm(dino_bb.keys()):
         # no dino-bbs for this frame pair
@@ -97,8 +144,28 @@ def run(args):
 
         sf, tf = int(key.split("_")[0]), int(key.split("_")[1])
         
-        bb = compute_bb_nms(dino_bb[f'{sf}_{tf}'], sf, tf, dino_emb, coords, args.stride, args.box_size, args.iou_thresh)
-        bb_rev = compute_bb_nms(dino_bb[f'{tf}_{sf}'], tf, sf, dino_emb, coords, args.stride, args.box_size, args.iou_thresh)
+        bb = compute_bb_nms(
+            dino_bb[f'{sf}_{tf}'],
+            sf,
+            tf,
+            dino_emb,
+            coords,
+            args.stride,
+            args.box_size,
+            args.iou_thresh,
+            affinity_chunk_size=args.affinity_chunk_size,
+        )
+        bb_rev = compute_bb_nms(
+            dino_bb[f'{tf}_{sf}'],
+            tf,
+            sf,
+            dino_emb,
+            coords,
+            args.stride,
+            args.box_size,
+            args.iou_thresh,
+            affinity_chunk_size=args.affinity_chunk_size,
+        )
         
         bb, bb_rev = compute_max_r(bb, bb_rev)
         
@@ -116,7 +183,11 @@ if __name__ == "__main__":
     parser.add_argument("--dino-emb-path", type=str, required=True)
     parser.add_argument("--out-path", type=str, required=True)
     parser.add_argument("--stride", type=int, default=7)
+    parser.add_argument("--h", type=int, default=476)
+    parser.add_argument("--w", type=int, default=854)
     parser.add_argument("--box-size", type=int, default=50)
     parser.add_argument("--iou-thresh", type=float, default=0.2)
+    parser.add_argument("--affinity-chunk-size", type=int, default=1024)
+    parser.add_argument("--num-cpu-threads", type=int, default=None)
     args = parser.parse_args()
     run(args)

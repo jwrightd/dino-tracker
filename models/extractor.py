@@ -98,11 +98,17 @@ class VitExtractor(nn.Module):
             if block_idx in self.layers_dict[VitExtractor.BLOCK_KEY]:
                 self.hook_handlers.append(block.register_forward_hook(self._get_block_hook()))
             if block_idx in self.layers_dict[VitExtractor.ATTN_KEY]:
-                self.hook_handlers.append(block.attn.attn_drop.register_forward_hook(self._get_attn_hook()))
+                attn_drop = getattr(getattr(block, "attn", None), "attn_drop", None)
+                if hasattr(attn_drop, "register_forward_hook"):
+                    self.hook_handlers.append(attn_drop.register_forward_hook(self._get_attn_hook()))
             if block_idx in self.layers_dict[VitExtractor.QKV_KEY]:
-                self.hook_handlers.append(block.attn.qkv.register_forward_hook(self._get_qkv_hook()))
+                qkv = getattr(getattr(block, "attn", None), "qkv", None)
+                if hasattr(qkv, "register_forward_hook"):
+                    self.hook_handlers.append(qkv.register_forward_hook(self._get_qkv_hook()))
             if block_idx in self.layers_dict[VitExtractor.PATCH_IMD_KEY]:
-                self.hook_handlers.append(block.attn.register_forward_hook(self._get_patch_imd_hook()))
+                attn = getattr(block, "attn", None)
+                if hasattr(attn, "register_forward_hook"):
+                    self.hook_handlers.append(attn.register_forward_hook(self._get_patch_imd_hook()))
 
     def _clear_hooks(self):
         for handler in self.hook_handlers:

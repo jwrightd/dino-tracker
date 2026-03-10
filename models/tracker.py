@@ -9,6 +9,7 @@ from models.networks.delta_dino import DeltaDINO
 from models.utils import load_pre_trained_model
 from data.dataset import RangeNormalizer
 from utils import bilinear_interpolate_video
+from device_utils import clear_device_cache, get_device
 
 
 EPS = 1e-08
@@ -22,7 +23,7 @@ class Tracker(nn.Module):
         dino_embed_path="",
         dino_patch_size=14,
         stride=7,
-        device="cuda:0",
+        device=None,
         
         cyc_n_frames=4,
         cyc_batch_size_per_frame=256,
@@ -33,7 +34,9 @@ class Tracker(nn.Module):
 
         self.stride = stride
         self.dino_patch_size = dino_patch_size
-        self.device = device
+        if device is None:
+            device = get_device()
+        self.device = torch.device(device)
         self.refined_features = None
         self.dino_embed_path = dino_embed_path
         self.ckpt_path = ckpt_path
@@ -48,7 +51,7 @@ class Tracker(nn.Module):
         self.load_dino_embed_video()
 
         # Delta-DINO
-        self.delta_dino = DeltaDINO(vit_stride=self.stride).to(device)
+        self.delta_dino = DeltaDINO(vit_stride=self.stride).to(self.device)
 
         # CNN-Refiner
         t, c, h, w = self.video.shape
@@ -58,8 +61,8 @@ class Tracker(nn.Module):
                                         step_h=stride,
                                         step_w=stride,
                                         video_h=h,
-                                        video_w=w).to(device)
-        self.range_normalizer = RangeNormalizer(shapes=(w, h, self.video.shape[0]))
+                                        video_w=w).to(self.device)
+        self.range_normalizer = RangeNormalizer(shapes=(w, h, self.video.shape[0]), device=self.device)
     
     @torch.no_grad()
     def load_dino_embed_video(self):
@@ -88,8 +91,10 @@ class Tracker(nn.Module):
         bh = 1 - last_coord_h * 2 / ( last_coord_h - ( patch_size / 2 ))
         bw = 1 - last_coord_w * 2 / ( last_coord_w - ( patch_size / 2 ))
         
-        a = torch.tensor([[aw, ah, 1]]).to(self.device)
-        b = torch.tensor([[bw, bh, 0]]).to(self.device)
+        points_device = points.device
+        points_dtype = points.dtype
+        a = torch.tensor([[aw, ah, 1]], device=points_device, dtype=points_dtype)
+        b = torch.tensor([[bw, bh, 0]], device=points_device, dtype=points_dtype)
         normalized_points = a * points + b
         return normalized_points
     
@@ -129,17 +134,17 @@ class Tracker(nn.Module):
         return refined_embeddings, residual_embeddings
     
     def cache_refined_embeddings(self, move_dino_to_cpu=False):
-        refined_features, _ = self.get_refined_embeddings(torch.arange(0, self.video.shape[0]))
+        refined_features, _ = self.get_refined_embeddings(torch.arange(0, self.video.shape[0], device=self.video.device))
         self.refined_features = refined_features
         if move_dino_to_cpu:
             self.dino_embed_video = self.dino_embed_video.to("cpu")
     
     def uncache_refined_embeddings(self, move_dino_to_gpu=False):
         self.refined_features = None
-        torch.cuda.empty_cache()
+        clear_device_cache(self.device)
         gc.collect()
         if move_dino_to_gpu:
-            self.dino_embed_video = self.dino_embed_video.to("cuda")
+            self.dino_embed_video = self.dino_embed_video.to(self.device)
     
     def save_weights(self, iter):
         torch.save(self.tracker_head.state_dict(), Path(self.ckpt_path) / f"tracker_head_{iter}.pt")
@@ -147,17 +152,22 @@ class Tracker(nn.Module):
         
     def load_weights(self, iter):
         self.tracker_head = load_pre_trained_model(
-            torch.load(os.path.join(self.ckpt_path, f"tracker_head_{iter}.pt")),
+            torch.load(os.path.join(self.ckpt_path, f"tracker_head_{iter}.pt"), map_location=self.device),
             self.tracker_head
         )
         self.delta_dino = load_pre_trained_model(
-            torch.load(os.path.join(self.ckpt_path, f"delta_dino_{iter}.pt")),
+            torch.load(os.path.join(self.ckpt_path, f"delta_dino_{iter}.pt"), map_location=self.device),
             self.delta_dino
         )
     
     def get_corr_maps_for_frame_set(self, source_embeddings, frame_embeddings_set, target_frame_indices):
         corr_maps_set = torch.einsum("bc,nchw->bnhw", source_embeddings, frame_embeddings_set)
-        corr_maps = corr_maps_set[torch.arange(source_embeddings.shape[0]), target_frame_indices.int(), :, :]
+        corr_maps = corr_maps_set[
+            torch.arange(source_embeddings.shape[0], device=target_frame_indices.device),
+            target_frame_indices.int(),
+            :,
+            :,
+        ]
         
         embeddings_norm = frame_embeddings_set.norm(dim=1)
         target_embeddings_norm = embeddings_norm[target_frame_indices.int()]
@@ -188,7 +198,7 @@ class Tracker(nn.Module):
         h, w = fg_masks.shape[-2:]
         x = torch.arange(w, device=fg_masks.device).float()
         y = torch.arange(h, device=fg_masks.device).float()
-        yy, xx = torch.meshgrid(y, x)
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
         xx = xx.reshape(-1)
         yy = yy.reshape(-1)
         grid_coords = torch.stack([xx, yy], dim=-1)
@@ -212,9 +222,9 @@ class Tracker(nn.Module):
             frame_fg_mask = fg_masks[source_t] > 0
             frame_bg_mask = ~frame_fg_mask
             frame_coords_fg = grid_coords[frame_fg_mask.reshape(-1)]
-            frame_coords_fg = frame_coords_fg[torch.randperm(frame_coords_fg.shape[0])[:BATCH_SIZE_FG]]
+            frame_coords_fg = frame_coords_fg[torch.randperm(frame_coords_fg.shape[0], device=frame_coords_fg.device)[:BATCH_SIZE_FG]]
             frame_coords_bg = grid_coords[frame_bg_mask.reshape(-1)]
-            frame_coords_bg = frame_coords_bg[torch.randperm(frame_coords_bg.shape[0])[:BATCH_SIZE_BG]]
+            frame_coords_bg = frame_coords_bg[torch.randperm(frame_coords_bg.shape[0], device=frame_coords_bg.device)[:BATCH_SIZE_BG]]
             frame_coords = torch.cat([frame_coords_fg, frame_coords_bg], dim=0)
             
             frame_coords = torch.cat([frame_coords, torch.ones((frame_coords.shape[0], 1), device=frame_coords.device)*source_t], dim=-1)

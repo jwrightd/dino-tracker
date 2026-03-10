@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as nnf
 import os
 import numpy as np
+from device_utils import get_device, grid_sample_border_safe
 
 
 def align_cnn_vit_features(vit_features_bchw: torch.Tensor, cnn_features_bchw: torch.Tensor,
@@ -38,10 +39,14 @@ def align_cnn_vit_features(vit_features_bchw: torch.Tensor, cnn_features_bchw: t
 
         vit_grid_x, vit_grid_y = torch.meshgrid(-1. - (1. / c_br[1]) + (2. * vit_x / c_br[1]),
                                                 -1 - (1. / c_br[0]) + (2. * vit_y / c_br[0]), indexing='xy')
-        grid = torch.stack([vit_grid_x, vit_grid_y], dim=-1)[None, ...].expand(vit_features_bchw.shape[0], -1, -1, -1)
+    grid = torch.stack([vit_grid_x, vit_grid_y], dim=-1)[None, ...].expand(vit_features_bchw.shape[0], -1, -1, -1)
     grid.requires_grad_(False)  # do not propagate gradients to the grid, only to the sampled features.
-    aligned_cnn_features = nnf.grid_sample(cnn_features_bchw, grid=grid, mode='bilinear',
-                                           padding_mode='border', align_corners=True)
+    aligned_cnn_features = grid_sample_border_safe(
+        cnn_features_bchw,
+        grid=grid,
+        mode="bilinear",
+        align_corners=True,
+    )
     return aligned_cnn_features
 
 
@@ -51,7 +56,12 @@ target_coords: N x 2
 fg_mask: H x W
 '''
 def filter_bb_foreground_pairs(source_coords, target_coords, fg_mask, resw=854, resh=476):
-    fg_mask_source = nnf.grid_sample(fg_mask[None, None, ...].float(), 2 * (source_coords[None, None, ...] / torch.tensor([resw, resh]).cuda()) - 1).squeeze()
+    coord_scale = torch.tensor([resw, resh], device=source_coords.device, dtype=source_coords.dtype)
+    fg_mask_source = nnf.grid_sample(
+        fg_mask[None, None, ...].float(),
+        2 * (source_coords[None, None, ...] / coord_scale) - 1,
+        align_corners=True,
+    ).squeeze()
     fg_mask_source = fg_mask_source > 0
     if len(fg_mask_source.shape) < 1:
         fg_mask_source = fg_mask_source.unsqueeze(0)
@@ -84,11 +94,13 @@ def get_feature_cos_sims(fs, ft):
     return torch.einsum("bchw,bchw->bhw", fs, ft) / (fs_n * ft_n)
 
 
-def get_vit_feature_coords_from_mask(h, w, step=7, patch_size=14, device="cuda"):
+def get_vit_feature_coords_from_mask(h, w, step=7, patch_size=14, device=None):
+    if device is None:
+        device = get_device()
     half_ps = patch_size // 2
     x = torch.arange(half_ps, w - half_ps + 1, step=step, device=device).float()
     y = torch.arange(half_ps, h - half_ps + 1, step=step, device=device).float()
-    yy, xx = torch.meshgrid(y, x)
+    yy, xx = torch.meshgrid(y, x, indexing="ij")
     xx = xx.reshape(-1)
     yy = yy.reshape(-1)
     grid = torch.stack([xx, yy], dim=-1)
@@ -100,5 +112,4 @@ def fix_random_seeds(seed=31):
     Fix random seeds.
     """
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)

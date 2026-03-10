@@ -1,5 +1,6 @@
 import math
 import torch
+from device_utils import clear_device_cache, get_device
 
 
 class RangeNormalizer(torch.nn.Module):
@@ -12,9 +13,11 @@ class RangeNormalizer(torch.nn.Module):
          shapes (tuple): represents the "boundaries"/maximal values for each input dimension.
             We assume that the dimensions range from 0 to max_value (as in pixels & frames).
     """
-    def __init__(self, shapes: tuple, device='cuda'):
+    def __init__(self, shapes: tuple, device=None):
         super().__init__()
 
+        if device is None:
+            device = get_device()
         normalizer = torch.tensor(shapes).float().to(device) - 1
         self.register_buffer("normalizer", normalizer)
 
@@ -60,12 +63,19 @@ class LongRangeSampler(torch.nn.Module):
                  bg_trajectories=None,
                  fg_traj_ratio=0.5,
                  num_frames=None,
-                 keep_in_cpu=False) -> None:
+                 keep_in_cpu=False,
+                 device=None) -> None:
         super().__init__()
 
         self.batch_size = batch_size
         self.num_frames = num_frames
         self.fg_traj_ratio = fg_traj_ratio
+        if device is None:
+            if fg_trajectories is not None:
+                device = fg_trajectories.device
+            else:
+                device = get_device()
+        self.device = torch.device(device)
         
         # allow storing a large number of trajectories in cpu, and keep small batches in gpu for faster sampling
         self.keep_in_cpu = keep_in_cpu
@@ -83,18 +93,18 @@ class LongRangeSampler(torch.nn.Module):
         else:
             self.fg_valid_trajectories_complete, self.fg_can_sample_complete = self.get_valid_trajectories(fg_trajectories)
             del fg_trajectories # free memory
-            torch.cuda.empty_cache()
+            clear_device_cache(self.device)
             # keep fg_valid_trajectories_complete in cpu and sample in batches from it
-            self.fg_valid_trajectories = self.fg_valid_trajectories_complete[:self.max_traj_size].cuda()
-            self.fg_can_sample = self.fg_can_sample_complete[:self.max_traj_size].cuda()
+            self.fg_valid_trajectories = self.fg_valid_trajectories_complete[:self.max_traj_size].to(self.device)
+            self.fg_can_sample = self.fg_can_sample_complete[:self.max_traj_size].to(self.device)
             self.n_batches_fg = math.ceil(self.fg_valid_trajectories_complete.shape[0] / self.max_traj_size)
 
             self.bg_valid_trajectories_complete, self.bg_can_sample_complete = self.get_valid_trajectories(bg_trajectories)
             del bg_trajectories # free memory
-            torch.cuda.empty_cache()
+            clear_device_cache(self.device)
             # keep bg_valid_trajectories_complete in cpu and sample in batches from it
-            self.bg_valid_trajectories = self.bg_valid_trajectories_complete[:self.max_traj_size].cuda()
-            self.bg_can_sample = self.bg_can_sample_complete[:self.max_traj_size].cuda()
+            self.bg_valid_trajectories = self.bg_valid_trajectories_complete[:self.max_traj_size].to(self.device)
+            self.bg_can_sample = self.bg_can_sample_complete[:self.max_traj_size].to(self.device)
             self.n_batches_bg = math.ceil(self.bg_valid_trajectories_complete.shape[0] / self.max_traj_size)
     
     def get_valid_trajectories(self, trajectories):
@@ -115,20 +125,20 @@ class LongRangeSampler(torch.nn.Module):
             del self.can_sample, self.valid_trajectories # free memory
             batch_index = self.gpu_batch_index % self.n_batches
             start_index, end_index = batch_index * self.max_traj_size, min((batch_index + 1) * self.max_traj_size, self.valid_trajectories_complete.shape[0])
-            self.valid_trajectories = self.valid_trajectories_complete[start_index:end_index].cuda()
-            self.can_sample = self.can_sample_complete[start_index:end_index].cuda()
+            self.valid_trajectories = self.valid_trajectories_complete[start_index:end_index].to(self.device)
+            self.can_sample = self.can_sample_complete[start_index:end_index].to(self.device)
         if hasattr(self, "fg_valid_trajectories_complete"):
             del self.fg_can_sample, self.fg_valid_trajectories
             fg_batch_index = self.gpu_batch_index % self.n_batches_fg
             start_index, end_index = fg_batch_index * self.max_traj_size, min((fg_batch_index + 1) * self.max_traj_size, self.fg_valid_trajectories_complete.shape[0])
-            self.fg_valid_trajectories = self.fg_valid_trajectories_complete[start_index:end_index].cuda()
-            self.fg_can_sample = self.fg_can_sample_complete[start_index:end_index].cuda()
+            self.fg_valid_trajectories = self.fg_valid_trajectories_complete[start_index:end_index].to(self.device)
+            self.fg_can_sample = self.fg_can_sample_complete[start_index:end_index].to(self.device)
         if hasattr(self, "bg_valid_trajectories_complete"):
             del self.bg_can_sample, self.bg_valid_trajectories
             bg_batch_index = self.gpu_batch_index % self.n_batches_bg
             start_index, end_index = bg_batch_index * self.max_traj_size, min((bg_batch_index + 1) * self.max_traj_size, self.bg_valid_trajectories_complete.shape[0])
-            self.bg_valid_trajectories = self.bg_valid_trajectories_complete[start_index:end_index].cuda()
-            self.bg_can_sample = self.bg_can_sample_complete[start_index:end_index].cuda()
+            self.bg_valid_trajectories = self.bg_valid_trajectories_complete[start_index:end_index].to(self.device)
+            self.bg_can_sample = self.bg_can_sample_complete[start_index:end_index].to(self.device)
 
     # used for legacy purposes
     @staticmethod
@@ -163,7 +173,14 @@ class LongRangeSampler(torch.nn.Module):
         b, t, _ = valid_trajectories.shape
         
         done_selecting_frames = False
-        
+        trajectories = None
+        can_sample_current = None
+        frame_indices = None
+
+        # Rarely, MPS can produce unstable behavior around multinomial sampling.
+        # Retry frame selection until we have enough valid rows for robust sampling.
+        max_retries = 20
+        retries = 0
         while not done_selecting_frames:
             times = torch.arange(t, device=valid_trajectories.device)
             t_selector = torch.randperm(times.shape[0], device=valid_trajectories.device)[:self.num_frames]
@@ -173,21 +190,41 @@ class LongRangeSampler(torch.nn.Module):
             if len(can_sample_current) >= 2:
                 trajectories = valid_trajectories[can_sample_at_frame_indices]
                 done_selecting_frames = True
+            retries += 1
+            if retries >= max_retries and not done_selecting_frames:
+                raise RuntimeError("Failed to select valid trajectory rows for timestep sampling.")
         
         batch_size_selector = torch.randperm(trajectories.shape[0], device=valid_trajectories.device)[:batch_size]
+        trajectories = trajectories[batch_size_selector]
         can_sample_current = can_sample_current[batch_size_selector]
-        
-        can_sample_in_frame_indices = can_sample_current[:, frame_indices]
-        can_sample_current[:, :] = False
-        can_sample_current[:, frame_indices] = can_sample_in_frame_indices
-        only_2_ts = can_sample_current.float().multinomial(2, replacement=False) # batch_size x 2
+
+        # Restrict candidate timestamps to the sampled frame subset.
+        # Run this small sampling step on CPU for stability on MPS.
+        trajectories_cpu = trajectories.cpu()
+        can_sample_cpu = can_sample_current.cpu()
+        frame_indices_cpu = frame_indices.cpu()
+
+        can_sample_in_frame_indices = can_sample_cpu[:, frame_indices_cpu]
+        sampled_ts_mask = torch.zeros_like(can_sample_cpu, dtype=torch.bool)
+        sampled_ts_mask[:, frame_indices_cpu] = can_sample_in_frame_indices
+
+        # Guard against invalid rows before multinomial.
+        valid_rows = sampled_ts_mask.float().sum(dim=1) >= 2
+        sampled_ts_mask = sampled_ts_mask[valid_rows]
+        trajectories_cpu = trajectories_cpu[valid_rows]
+        if sampled_ts_mask.shape[0] == 0:
+            raise RuntimeError("No valid rows remained for timestep multinomial sampling.")
+
+        only_2_ts = torch.multinomial(sampled_ts_mask.float(), 2, replacement=False) # batch_size x 2
         t1, t2 = only_2_ts.unbind(dim=1) # batch_size x 1
-        t1_points = trajectories[batch_size_selector, t1]
-        t2_points = trajectories[batch_size_selector, t2]
+        row_idx = torch.arange(trajectories_cpu.shape[0], dtype=torch.long)
+        t1_points = trajectories_cpu[row_idx, t1]
+        t2_points = trajectories_cpu[row_idx, t2]
         t1_points = torch.cat([t1_points, t1.unsqueeze(dim=-1)], dim=-1)
         t2_points = torch.cat([t2_points, t2.unsqueeze(dim=-1)], dim=-1)
-        
-        return t1_points, t2_points
+
+        device = valid_trajectories.device
+        return t1_points.to(device), t2_points.to(device)
     
     def get_fg_batch_size(self):
         return int(self.batch_size * self.fg_traj_ratio)
@@ -219,13 +256,15 @@ class DinoTrackerSampler(LongRangeSampler):
         fg_traj_ratio=0.5,
         num_frames=None,
         keep_in_cpu=False,
+        device=None,
         ) -> None:
         super().__init__(batch_size,
                          fg_trajectories=fg_trajectories,
                          bg_trajectories=bg_trajectories,
                          fg_traj_ratio=fg_traj_ratio,
                          num_frames=num_frames,
-                         keep_in_cpu=keep_in_cpu)
+                         keep_in_cpu=keep_in_cpu,
+                         device=device)
 
         self.range_normalizer = range_normalizer
         self.dst_range = dst_range

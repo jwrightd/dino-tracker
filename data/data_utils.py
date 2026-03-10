@@ -9,10 +9,15 @@ from torchvision import transforms
 from PIL import Image
 import imageio.v3 as iiov3
 import matplotlib.pyplot as plt
+from device_utils import get_device
 
 
 def load_image(imfile, device="cpu", resize_h=None, resize_w=None):
     img_pil = Image.open(imfile)
+    # Keep model code robust when source frames are grayscale on disk.
+    # RAFT/DINO paths expect 3-channel inputs.
+    if img_pil.mode != "RGB":
+        img_pil = img_pil.convert("RGB")
     if resize_h is not None:
         img_pil = img_pil.resize((resize_w, resize_h), Image.LANCZOS)
     img = np.array(img_pil).astype(np.uint8)
@@ -96,10 +101,13 @@ def load_video(video_folder: str, resize=None, num_frames=None):
     video = []
     
     for file in input_files:
+        img = Image.open(str(file))
+        if img.mode != "RGB":
+            img = img.convert("RGB")
         if resize is not None:
-            video.append(transforms.ToTensor()(Image.open(str(file)).resize((resw, resh), Image.LANCZOS)))
+            video.append(transforms.ToTensor()(img.resize((resw, resh), Image.LANCZOS)))
         else:
-            video.append(transforms.ToTensor()(Image.open(str(file))))
+            video.append(transforms.ToTensor()(img))
     
     return torch.stack(video)
 
@@ -114,7 +122,44 @@ def save_video(video, output_path, fps=30):
         fps (int): frames per second. Defaults to 30.
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    iiov3.imwrite(output_path, video, fps=fps, macro_block_size=None)
+    ext = os.path.splitext(output_path)[1].lower()
+    if ext == ".mp4":
+        # Prefer OpenCV writer for robustness on macOS where imageio plugin
+        # selection may fall back to non-video backends (e.g. TIFF).
+        h, w = video.shape[1], video.shape[2]
+        writer = cv2.VideoWriter(
+            output_path,
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            float(fps),
+            (w, h),
+        )
+        if writer.isOpened():
+            try:
+                for frame in video:
+                    frame_u8 = frame
+                    if frame_u8.dtype != np.uint8:
+                        frame_u8 = np.clip(frame_u8, 0, 255).astype(np.uint8)
+                    if frame_u8.ndim == 2:
+                        frame_bgr = cv2.cvtColor(frame_u8, cv2.COLOR_GRAY2BGR)
+                    else:
+                        frame_bgr = cv2.cvtColor(frame_u8, cv2.COLOR_RGB2BGR)
+                    writer.write(frame_bgr)
+            finally:
+                writer.release()
+            return
+        writer.release()
+
+        # Fallback to imageio ffmpeg plugin explicitly.
+        writer = imageio.get_writer(output_path, fps=fps, macro_block_size=None, format="FFMPEG")
+        try:
+            for frame in video:
+                writer.append_data(frame)
+        finally:
+            writer.close()
+        return
+
+    # Non-video formats are written as image stacks without fps metadata.
+    iiov3.imwrite(output_path, video)
 
 
 def save_video_frames(video, folder: str, matplotlib=False):
@@ -167,16 +212,18 @@ def resize_flow(flow, newh, neww):
 def get_points_on_an_interval_grid(interval, interp_shape, device="cpu"):
     grid_y = torch.arange(0, interp_shape[0], interval, device=device) # Y
     grid_x = torch.arange(0, interp_shape[1], interval, device=device) # X
-    grid_y, grid_x = torch.meshgrid(grid_y, grid_x)
+    grid_y, grid_x = torch.meshgrid(grid_y, grid_x, indexing="ij")
     xy = torch.stack([grid_x, grid_y], dim=-1).to(device) # Y x X x 2, where 2 is the (x, y) coordinates
     xy = xy.reshape(-1, 2).unsqueeze(0) # 1 x (Y * X) x 2
     return xy
 
 
-def get_grid_query_points(res_h_w, segm_mask=None, device="cuda", interval=None, query_frame=0):
+def get_grid_query_points(res_h_w, segm_mask=None, device=None, interval=None, query_frame=0):
     """
     res_h_w: tuple of (height, width) of the video. segm_mask: H x W tensor. interval: pixel interval between the grid points.
     """
+    if device is None:
+        device = get_device()
     grid_pts = get_points_on_an_interval_grid(interval, res_h_w, device=device) # 1 x (Y * X) x 2
     
     if segm_mask is not None:
