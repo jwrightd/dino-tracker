@@ -57,52 +57,87 @@ def filter_bg_trajectories_for_homographies(bg_tracjectories, bg_trajectories_co
     of_idx_list = torch.unique(of_idx_list.reshape(-1))
     return bg_tracjectories[of_idx_list]
 
+
+def load_mask_volume(masks_path: Path, num_frames: int, target_hw):
+    mask_paths = sorted(list(masks_path.glob("*.jpg")) + list(masks_path.glob("*.png")))
+    if len(mask_paths) < num_frames:
+        raise ValueError(
+            f"Expected at least {num_frames} masks in '{masks_path}', found {len(mask_paths)}."
+        )
+
+    target_h, target_w = target_hw
+    masks = []
+    for mask_path in mask_paths[:num_frames]:
+        mask = torch.from_numpy(np.array(Image.open(mask_path).convert("L"))).bool().float()
+        if mask.shape != (target_h, target_w):
+            mask = torch.nn.functional.interpolate(
+                mask.unsqueeze(0).unsqueeze(0),
+                size=(target_h, target_w),
+                mode="nearest",
+            ).squeeze(0).squeeze(0)
+        masks.append(mask.bool().cpu().numpy())
+    return np.stack(masks, axis=0)
+
+
+def select_visualized_tracks(tracks, occluded, segm_masks, max_tracks=None, min_visible_ratio=0.0, min_mask_ratio=0.0):
+    coords = np.round(tracks).astype(np.int32)
+    coords[..., 0] = np.clip(coords[..., 0], 0, segm_masks.shape[2] - 1)
+    coords[..., 1] = np.clip(coords[..., 1], 0, segm_masks.shape[1] - 1)
+
+    frame_indices = np.arange(tracks.shape[1])[None, :]
+    on_mask = segm_masks[frame_indices, coords[..., 1], coords[..., 0]]
+    visible = occluded <= 0
+    visible_count = np.maximum(visible.sum(axis=1), 1)
+    visible_ratio = visible.mean(axis=1)
+    mask_ratio = (on_mask & visible).sum(axis=1) / visible_count
+
+    keep = (visible_ratio >= min_visible_ratio) & (mask_ratio >= min_mask_ratio)
+    keep_idx = np.where(keep)[0]
+    if keep_idx.size == 0:
+        return np.arange(tracks.shape[0]), visible_ratio, mask_ratio
+
+    if max_tracks is not None and keep_idx.size > max_tracks:
+        ranking = np.lexsort((-mask_ratio[keep_idx], -visible_ratio[keep_idx]))
+        keep_idx = keep_idx[ranking[:max_tracks]]
+    return keep_idx, visible_ratio, mask_ratio
+
 @torch.no_grad()
 def run(args):
     device = get_device(log=True)
     config_paths = add_config_paths(args.data_path, {})
     video_folder = config_paths["video_folder"]
     masks_path = Path(config_paths["masks_path"])
-    segm_mask_path = sorted(list(Path(masks_path).glob("*.jpg")) + list(Path(masks_path).glob("*.png")))[args.vis_start_frame]
     bg_of_trajectories_path = config_paths["bg_trajectories_file"]
-    trajs_path = os.path.join(config_paths["grid_trajectories_dir"], f"grid_trajectories.npy")
-    occ_path = os.path.join(config_paths["grid_occlusions_dir"], f"grid_occlusions.npy")
+    trajs_path = args.trajectories_path or os.path.join(config_paths["grid_trajectories_dir"], "grid_trajectories.npy")
+    occ_path = args.occlusions_path or os.path.join(config_paths["grid_occlusions_dir"], "grid_occlusions.npy")
     model_vis_dir = config_paths['model_vis_dir']
-    
-
-    video = load_video(video_folder, num_frames=300) # T x 3 x H x W, torch.float32, [0, 1]
-    video = (video.permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8) # T x H x W x 3, numpy.uint8, [0, 255]
-    video_h, video_w = video.shape[1], video.shape[2]
 
     tracks = np.load(trajs_path) # [N, T, 2]
     if tracks.shape[0] == 0:
         raise ValueError(f"No grid tracks found in '{trajs_path}'. Run inference_grid.py first.")
-    if args.infer_res_size is not None:
-        pred_h, pred_w = args.infer_res_size
-        tracks = tracks * np.array([video_w / pred_w, video_h / pred_h], dtype=np.float32) # resize tracks to video resolution
-    
     try:
         occluded = np.load(occ_path).astype(np.int32) # [N, T]
     except:
         print(f"{occ_path} does not exist, marking all points as visible ---")
         occluded = np.zeros(tracks.shape[:-1])
-    
-    # load segmentation mask
-    segm_mask = torch.from_numpy(np.array(Image.open(segm_mask_path).convert("L"))).bool().float().cpu().numpy()
-    if segm_mask.shape != (video_h, video_w):
-        segm_mask = torch.nn.functional.interpolate(torch.from_numpy(segm_mask).unsqueeze(0).unsqueeze(0), size=(video_h, video_w), mode="nearest").squeeze().cpu().numpy() # H x W
-    
+
+    requested_video_frames = min(
+        tracks.shape[1],
+        occluded.shape[1],
+        args.vis_end_frame if args.vis_end_frame is not None else tracks.shape[1],
+    )
+    video = load_video(video_folder, num_frames=requested_video_frames) # T x 3 x H x W, torch.float32, [0, 1]
+    video = (video.permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8) # T x H x W x 3, numpy.uint8, [0, 255]
+    video_h, video_w = video.shape[1], video.shape[2]
+
+    if args.infer_res_size is not None:
+        pred_h, pred_w = args.infer_res_size
+        tracks = tracks * np.array([video_w / pred_w, video_h / pred_h], dtype=np.float32) # resize tracks to video resolution
+
+    segm_masks = load_mask_volume(masks_path, requested_video_frames, (video_h, video_w))
     if args.erosion_kernel_size is not None:
         erosion_kernel = torch.ones(args.erosion_kernel_size, args.erosion_kernel_size)
-        segm_mask = morph.erosion(torch.from_numpy(segm_mask).float()[None, None], erosion_kernel).bool().squeeze()  # Erosion, H x W
-
-    coords = tracks[:,0].round().astype(np.int32)
-    coords[:, 0] = np.clip(coords[:, 0], 0, segm_mask.shape[1] - 1)
-    coords[:, 1] = np.clip(coords[:, 1], 0, segm_mask.shape[0] - 1)
-    is_fg = (segm_mask[coords[:, 1], coords[:, 0]] > 0)
-    if not np.any(is_fg):
-        print("No foreground tracks selected by the segmentation mask; falling back to all tracks.", flush=True)
-        is_fg = np.ones(tracks.shape[0], dtype=bool)
+        segm_masks = morph.erosion(torch.from_numpy(segm_masks).float()[:, None], erosion_kernel).bool().squeeze(1).cpu().numpy()
 
     vis_start_frame = args.vis_start_frame # default 0
     max_common_frames = min(video.shape[0], tracks.shape[1], occluded.shape[1])
@@ -112,12 +147,36 @@ def run(args):
     video = video[vis_start_frame:vis_end_frame]
     tracks = tracks[:, vis_start_frame:vis_end_frame]
     occluded = occluded[:, vis_start_frame:vis_end_frame]
+    segm_masks = segm_masks[vis_start_frame:vis_end_frame]
+
+    keep_idx, visible_ratio, mask_ratio = select_visualized_tracks(
+        tracks,
+        occluded,
+        segm_masks,
+        max_tracks=args.max_tracks,
+        min_visible_ratio=args.min_visible_ratio,
+        min_mask_ratio=args.min_mask_ratio,
+    )
+    if keep_idx.size == 0:
+        print("No tracks passed strict filtering; falling back to all tracks.", flush=True)
+        keep_idx = np.arange(tracks.shape[0])
+    else:
+        print(
+            f"Keeping {keep_idx.size}/{tracks.shape[0]} tracks "
+            f"(min_visible_ratio={args.min_visible_ratio}, min_mask_ratio={args.min_mask_ratio}).",
+            flush=True,
+        )
+        print(
+            f"Visible ratio median={np.median(visible_ratio[keep_idx]):.3f}, "
+            f"mask ratio median={np.median(mask_ratio[keep_idx]):.3f}",
+            flush=True,
+        )
 
     
     os.makedirs(model_vis_dir, exist_ok=True)
     dotted_vis_name = f"dotted_tracks_fps_{args.fps}.mp4" if args.erosion_kernel_size is None else f"dotted_tracks_erosion_kernel_{args.erosion_kernel_size}_fps_{args.fps}.mp4"
-    tracks_video_no_trace = viz_utils.plot_tracks_v2(video, tracks[is_fg], occluded[is_fg], rainbow_colors=True, point_size=args.point_size)
-    print(tracks_video_no_trace.shape, video.shape, tracks[is_fg].shape, occluded[is_fg].shape)
+    tracks_video_no_trace = viz_utils.plot_tracks_v2(video, tracks[keep_idx], occluded[keep_idx], rainbow_colors=True, point_size=args.point_size)
+    print(tracks_video_no_trace.shape, video.shape, tracks[keep_idx].shape, occluded[keep_idx].shape)
     save_video(tracks_video_no_trace, os.path.join(model_vis_dir, dotted_vis_name), fps=args.fps)
     
     if args.plot_trails:
@@ -148,12 +207,13 @@ def run(args):
 
             rainbow_video = viz_utils.plot_tracks_tails(
                 video,
-                tracks[is_fg],
-                occluded[is_fg],
+                tracks[keep_idx],
+                occluded[keep_idx],
                 homogs, 
                 point_size=args.point_size,
                 linewidth=args.linewidth,
                 marker="D",
+                trail_length=args.trail_length,
             )
             rainbow_vis_name = f"rainbow_erosion_kernel_{args.erosion_kernel_size}_fps_{args.fps}.mp4" if args.erosion_kernel_size is not None else f"rainbow_fps_{args.fps}.mp4"
             save_video(rainbow_video, os.path.join(model_vis_dir, rainbow_vis_name), fps=args.fps)
@@ -166,6 +226,8 @@ def run(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", default="./dataset/libby", type=str)
+    parser.add_argument("--trajectories-path", default=None, type=str, help="Optional explicit path to a grid trajectory .npy file.")
+    parser.add_argument("--occlusions-path", default=None, type=str, help="Optional explicit path to a grid occlusion .npy file.")
     parser.add_argument("--infer-res-size", type=int, nargs=2, default=(476, 854), help="Inference resolution size, (h, w). --NOTE-- change according to values in train.yaml.")
     parser.add_argument("--of-res-size", type=int, nargs=2, default=(476, 854), help="Optical flow resolution size, (h, w). --NOTE-- change according to values in preprocess.yaml.")
     parser.add_argument("--erosion-kernel-size", type=int, default=None, help="size of the erosion kernel for the segmentation mask. If None, no erosion is applied.")
@@ -175,6 +237,10 @@ if __name__ == "__main__":
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--point-size", type=int, default=40)
     parser.add_argument("--linewidth", type=float, default=1.5)
+    parser.add_argument("--trail-length", type=int, default=None, help="Optional max number of previous frames to draw for each trail.")
+    parser.add_argument("--max-tracks", type=int, default=None, help="Optional cap on rendered foreground tracks after strict filtering.")
+    parser.add_argument("--min-visible-ratio", type=float, default=0.0, help="Keep only tracks visible for at least this fraction of frames.")
+    parser.add_argument("--min-mask-ratio", type=float, default=0.0, help="Keep only tracks that stay inside the segmentation mask for at least this fraction of visible frames.")
     parser.add_argument("--plot-trails", action="store_true", default=False, help="Plot rainbow trails using homographies.")
     args = parser.parse_args()
     

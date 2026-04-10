@@ -11,5 +11,6 @@ mediapy
 numpy
 pandas
 pillow
+scipy
 tqdm
 PyYAML

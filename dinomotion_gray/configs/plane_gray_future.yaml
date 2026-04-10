@@ -1,0 +1,27 @@
+video:
+  vis_fps: 10
+
+future_generation:
+  method: shih_tps
+  history: 24
+  horizon: 16
+  min_visible_ratio: 0.6
+  min_anchor_distance: 20.0
+  max_anchors: 10
+  affine_blend: 0.8
+  background_history: 120
+  tps_smoothing: 0.001
+  feather_sigma: 1.5
+  mask_dilation: 11
+  mask_dirname: masks_sam2
+  output_tag: shih_tps_future
+  fps: 10
+  dynamics:
+    hidden_dim: 128
+    num_layers: 2
+    dropout: 0.1
+    lr: 0.001
+    weight_decay: 0.00001
+    batch_size: 32
+    steps: 700
+    seed: 7

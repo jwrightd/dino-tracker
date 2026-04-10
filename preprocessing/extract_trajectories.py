@@ -45,6 +45,19 @@ def estimate_flow_buffer_gib(num_images: int, h: int, w: int, dtype=torch.float3
     return (n_elems * elem_size) / (1024 ** 3)
 
 
+def filter_valid_trajectories_cpu(padded_trajectories: torch.Tensor, min_trajectory_length: int) -> torch.Tensor:
+    """
+    MPS is brittle around advanced boolean indexing on large tensors.
+    Keep the heavy trajectory rollout on-device, then do row filtering on CPU.
+    """
+    padded_cpu = padded_trajectories.to("cpu")
+    one_nan_least = padded_cpu.isnan().any(dim=-1)
+    set_nans = repeat(one_nan_least, "traj t -> traj t 2")
+    padded_cpu[set_nans] = float("nan")
+    valid_lengths = padded_cpu.isnan().any(dim=-1).logical_not().sum(dim=-1)
+    return padded_cpu[valid_lengths >= min_trajectory_length]
+
+
 @torch.no_grad()
 def get_flows_with_masks(
     model,
@@ -241,13 +254,16 @@ def save_trajectories(args):
         mask = ~masks[starting_frame]
         if look_behind:
             # look at all trajectories starting before starting_frame, and collect the valid coordinates in starting_frame that they pass through.
-            past_passed = all_filtered_trajectories[:, starting_frame].to(selected_device) # (M x 2)
+            past_passed = all_filtered_trajectories[:, starting_frame] # (M x 2)
             past_passed = past_passed[past_passed.isnan().any(dim=-1).logical_not()] # M' x 2
             past_passed = past_passed.round().long()
-            past_passed = past_passed[((past_passed >= 0) & (past_passed <= upper_bound)).all(dim=-1)]
+            upper_bound_cpu = upper_bound.to("cpu")
+            past_passed = past_passed[((past_passed >= 0) & (past_passed <= upper_bound_cpu)).all(dim=-1)]
 
             not_passed_through = torch.ones_like(mask) # h x w
-            not_passed_through[past_passed[:, 1], past_passed[:, 0]] = False # set to False all locations that have existing trajectories passing through them.
+            if past_passed.numel() > 0:
+                past_passed = past_passed.to(selected_device)
+                not_passed_through[past_passed[:, 1], past_passed[:, 0]] = False # set to False all locations that have existing trajectories passing through them.
             mask |= not_passed_through
 
         nan_coords = torch.full_like(coords, torch.nan)
@@ -294,12 +310,8 @@ def save_trajectories(args):
             rearrange(trajectories, "t h w d -> h w d t"), (starting_frame, 0), mode="constant", value=float("nan")
         )
         padded_trajectories = rearrange(padded_trajectories, "h w d t -> (h w) t d")
-        one_nan_least = padded_trajectories.isnan().any(dim=-1)
-        set_nans = repeat(one_nan_least, "T t -> T t 2")
-        padded_trajectories[set_nans] = float("nan")
-        valid_lengths = padded_trajectories.isnan().any(dim=-1).logical_not().sum(dim=-1)
-        current_not_nan_traj = padded_trajectories[valid_lengths >= min_trajectory_length]
-        all_filtered_trajectories = torch.cat([all_filtered_trajectories, current_not_nan_traj.cpu()], dim=0) # (N x t x 2), (M x t x 2) -> ((M+N) x t x 2)
+        current_not_nan_traj = filter_valid_trajectories_cpu(padded_trajectories, min_trajectory_length)
+        all_filtered_trajectories = torch.cat([all_filtered_trajectories, current_not_nan_traj], dim=0) # (N x t x 2), (M x t x 2) -> ((M+N) x t x 2)
 
     torch.save(all_filtered_trajectories, output_path)
     print(f"Saved {output_path}, shape: {all_filtered_trajectories.shape}")

@@ -1,0 +1,57 @@
+video:
+  max_frames: 200
+  train_resize: [280, 476]
+  vis_fps: 10
+  frame_ext: png
+
+segmentation:
+  enabled: true
+  mode: bbox
+  config_path: ./sam2_masking/sam2_config.yaml
+  mask_dirname: masks_sam2
+  rgb_proxy_dirname: video_sam2_rgb
+
+model:
+  dino_model_name: dinov2_vitb14
+  lora_rank: 8
+  lora_alpha: 16.0
+  train_patch_embed: true
+
+tracking:
+  num_landmarks: 96
+  softmax_temperature: 0.04
+  nms_kernel_size: 5
+  warp_mode: affine
+  candidate_multiplier: 8
+  min_landmark_distance: 18.0
+  interior_weight: 0.45
+  grad_weight: 0.55
+  feature_weight: 0.45
+
+training:
+  steps: 400
+  batch_size: 2
+  lr: 0.0003
+  weight_decay: 0.00001
+  log_every: 10
+  save_every: 100
+  photometric_weight: 1.0
+  identity_weight: 0.05
+  descriptor_identity_weight: 0.15
+  temporal_triplet_weight: 0.12
+  temporal_descriptor_weight: 0.06
+
+refinement:
+  lk_window_size: 21
+  lk_max_level: 3
+  blend_alpha: 0.7
+  max_jump: 24.0
+  savgol_window_length: 11
+  savgol_polyorder: 3
+
+rendering:
+  trail_length: 18
+  max_trail_jump_px: 18.0
+  max_track_p95_jump_px: 25.0
+  min_visible_frames: 20
+  output_tag: stable

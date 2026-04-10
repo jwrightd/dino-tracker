@@ -1,0 +1,7 @@
+checkpoint: ./checkpoints/sam2.1_hiera_large.pt
+model_cfg: configs/sam2.1/sam2.1_hiera_l.yaml
+min_mask_area_ratio: 0.01
+points_per_side: 32
+pred_iou_thresh: 0.8
+stability_score_thresh: 0.92
+apply_postprocessing: false

@@ -678,7 +678,7 @@ def get_homographies_wrt_frame(
 
 
 def plot_tracks_tails(
-    rgb, points, occluded, homogs, point_size=12, linewidth=1.5, marker='o', colors_arr=None, trail_fade=True
+    rgb, points, occluded, homogs, point_size=12, linewidth=1.5, marker='o', colors_arr=None, trail_fade=True, trail_length=None
 ):
   """Plot rainbow tracks with matplotlib.
 
@@ -700,6 +700,7 @@ def plot_tracks_tails(
     marker: to control the marker shape.  Passed to plt.scatter.
     colors_arr: Optional colors array from distinctipy.get_colors, if not None, use these colors instead of the default. 
     trail_fade: if True, the trail will fade out as it gets older.
+    trail_length: Optional max number of prior frames to draw per trail.
   Returns:
     frames: rgb frames with rendered rainbow tracks.
   """
@@ -741,7 +742,8 @@ def plot_tracks_tails(
       inv_h_i = np.linalg.inv(homogs[i])
     except np.linalg.LinAlgError:
       inv_h_i = np.linalg.pinv(homogs[i])
-    for j in range(i - 1, -1, -1):
+    trail_start = max(0, i - trail_length) if trail_length is not None else 0
+    for j in range(i - 1, trail_start - 1, -1):
       points_homo = np.concatenate(
           [points[:, j], np.ones_like(points[:, j, 0:1])], axis=1
       )

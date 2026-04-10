@@ -1,4 +1,6 @@
 *__pycache__*
 .vscode
 .DS_Store
-
+.torch_cache_dinomotion/
+checkpoints/*.pt
+checkpoints/*.pth

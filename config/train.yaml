@@ -6,7 +6,7 @@ checkpoint_interval: 2500
 video_resw: 854
 video_resh: 476
 
-fg_traj_ratio: 0.5
+fg_traj_ratio: 0.7
 keep_traj_in_cpu: false # set to true for long videos (> 150 frames)
 train_batch_size: 512
 batch_n_frames: 4
@@ -14,7 +14,7 @@ batch_n_frames: 4
 
 
 ########################## optimization ##########################
-total_iterations: 10000
+total_iterations: 5000
 lr_delta_dino: 0.01
 lr_cnn_refiner: 0.01
 
@@ -63,3 +63,9 @@ dino_patch_size: 14
 ########################## Occlusion prediction ##########################
 anchor_cosine_similarity_threshold: 0.7
 cosine_similarity_threshold: 0.6
+
+########################## Postprocessing ##########################
+smoothing:
+  enabled: true
+  window_length: 11
+  polyorder: 3
